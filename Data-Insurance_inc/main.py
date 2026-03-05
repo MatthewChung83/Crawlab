@@ -28,7 +28,7 @@ original_stderr = sys.stderr
 
 from config import *
 from etl_func import *
-from dict import *
+
 
 # 移除 proxies 設定
 # proxies = {

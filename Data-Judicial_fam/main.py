@@ -21,7 +21,6 @@ import urllib
 
 from config import *
 from etl_func import *
-from dict import *
 
 
 server,database,username,password,fromtb,totb = db['server'],db['database'],db['username'],db['password'],db['fromtb'],db['totb']

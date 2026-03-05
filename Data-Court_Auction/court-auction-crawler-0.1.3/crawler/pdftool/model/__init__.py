@@ -1,1 +1,0 @@
-from .pdfreader import PDFReader

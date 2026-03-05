@@ -1,0 +1,42 @@
+# -*- coding: utf-8 -*-
+"""
+Configuration for HR-HRUserInfo - User info sync from HR API
+"""
+
+db = {
+    'server': '10.10.0.94',
+    'database': 'UCS_ETL',
+    'username': 'CLUSER',
+    'password': 'Ucredit7607',
+    'totb': 'ODS_HRUserInfo',
+}
+
+api = {
+    'main_url': 'https://hr.ucs.tw/SCSRwd/api/systemobject/',
+    'api_url': 'https://hr.ucs.tw/SCSRwd/api/businessobject/',
+    'company_id': 'scs164',
+    'user_id': 'api',
+    'password': 'api$1234',
+    'language_id': 'zh-TW',
+}
+
+# Field mapping for user info
+USER_FIELDS = [
+    'SYS_ID', 'SYS_COMPANYID', 'TMP_DECCOMPANYID', 'TMP_DECCOMPANYNAME', 'TMP_DECCOMPANYENGNAME',
+    'DEPARTID', 'DEPARTID2', 'TMP_DEPARTNAME', 'TMP_DEPARTENGNAME', 'SERIAL',
+    'EMPLOYEEID2', 'EMPLOYEEID', 'EMPLOYEENAME', 'EMPLOYEEENGNAME', 'IDNO',
+    'JOBSTATUS', 'COUNTRYNAME', 'BIRTHDATE', 'SEX', 'MARRAGE',
+    'BLOODTYPE', 'BIRTHPLACE', 'OTHER_BIRTHPLACE', 'VTITLEDEPARTID', 'HDEGREE',
+    'ISTOP', 'STARTDATE', 'WORKINGYEARS', 'SSTARTDATE', 'SPECIALYEARS',
+    'GARRIVEDATE', 'MOIBLE', 'OFFICETEL1', 'OFFICETEL2', 'PSNEMAI',
+    'EMAIL1', 'EMAIL2', 'REGTEL', 'REGADDRESS', 'COMMTEL',
+    'COMMADDRESS', 'EMERGENCYNAME', 'EMERGENCYTELNO', 'EMERGENCYMOBILE', 'EMERGENCYSEX',
+    'TMP_EMERGENCYID', 'TMP_EMERGENCYNAME', 'JOBCODENAME', 'JOBCODEENGNAME', 'JOBLEVELNAME',
+    'JOBLEVELENGNAME', 'JOBRANKNAME', 'JOBRANKENGNAME', 'JOBCODEID', 'JOBLEVELID',
+    'JOBRANKID', 'GD1', 'GD2', 'GD3', 'GD4',
+    'GD5', 'GD6', 'GD1_ID', 'GD2_ID', 'SELFDEF1',
+    'SELFDEF2', 'SELFDEF3', 'SELFDEF4', 'SELFDEF5', 'TMP_PROFITID',
+    'TMP_PROFITNAME', 'TMP_IDYCLASSID', 'TMP_IDYCLASSNAME', 'ISDIRECT', 'ETHNICID',
+    'ISDISABILITY', 'DISABILITYDEGREE', 'NOTE', 'WORKINGYEARSYMD', 'SELFDEF6',
+    'SELFDEF7', 'SELFDEF8', 'JOBDESCRIPTION', 'JOBCONTRACT',
+]

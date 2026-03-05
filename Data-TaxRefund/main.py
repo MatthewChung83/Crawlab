@@ -1,111 +1,87 @@
+# -*- coding: utf-8 -*-
+"""
+TaxRefund crawler - Tax refund query using Playwright
+"""
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import ddddocr
-import io
-import pymssql
 from datetime import datetime as dt
-import time
 
-imgp = r'./captcha_01.jpg'
+from config import *
+from etl_func import *
 
-def fromsql(host, user, password, database, src_tb):
-    conn = pymssql.connect(host=host, user=user, password=password, database=database)
-    cursor = conn.cursor(as_dict=True)
-    script = f"""select * from {src_tb} where info is null and type = 'ONHAND-20240801_01' order by pid"""
-    cursor.execute(script)
-    sql_src = cursor.fetchall()
-    cursor.close()
-    conn.close()
-    return sql_src
+# Parameters
+server, database, username, password = db['server'], db['database'], db['username'], db['password']
+src_tb, tar_tb = db['src_tb'], db['tar_tb']
+url = wbinfo['url']
+imgp = pics['imgp']
 
-def updatesql(host, user, password, database, tar_tb, info, psid, pid):
-    conn = pymssql.connect(host=host, user=user, password=password, database=database)
-    cursor = conn.cursor(as_dict=True)
-    script = f"""update {tar_tb} set info = '{info}' where psid = {psid} and pid = '{pid}'"""
-    print(script)
-    cursor.execute(script)
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-def retry_generator(data_list):
-    """
-    產生器，依序提供 data，並且在需要重試時重複提供相同資料(最大重試5次)
-    """
-    max_retry = 5
-    for record in data_list:
-        retries = 0
-        while retries < max_retry:
-            yield record, retries
-            retries += 1
 
 def run_playwright():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        Url = 'https://www.etax.nat.gov.tw/etwmain/etw133w1/e01'
-        page.goto(Url)
-        # 等待關鍵輸入框可用，避免過早操作
+        page.goto(url)
+
+        # Wait for main input field to be available
         try:
             page.wait_for_selector("#userIdnBan", timeout=10000)
         except PlaywrightTimeoutError:
             print("主要輸入框未出現，頁面加載可能有問題")
             browser.close()
             return
-        
-        src = fromsql('10.10.0.94', 'CLUSER', 'Ucredit7607', 'CL_Daily', 'taxrefundtb')
+
+        src = fromsql(server, username, password, database, src_tb)
 
         for record, attempt in retry_generator(src):
             psid = record['psid']
             pid = record['pid']
             print(f"處理 psid={psid}, pid={pid}, 嘗試第 {attempt+1} 次")
             try:
-                # 輸入身分證字號，先清空欄位
+                # Input ID number, clear field first
                 page.fill('#userIdnBan', '')
                 page.fill('#userIdnBan', pid)
-                
-                # 等待驗證碼圖片出現 (10秒timeout)
+
+                # Wait for captcha image (10s timeout)
                 captcha_element = page.wait_for_selector('etw-captcha img', timeout=10000)
-                
-                # 截圖驗證碼
+
+                # Screenshot captcha
                 img_bytes = captcha_element.screenshot()
                 with open(imgp, 'wb') as f:
                     f.write(img_bytes)
-                
-                # OCR 辨識
+
+                # OCR recognition
                 ocr = ddddocr.DdddOcr()
                 res = ocr.classification(img_bytes)
                 print(f"OCR 輸出: {res}")
-                
-                # 填入驗證碼
+
+                # Fill captcha
                 page.fill('#captchaText', res)
-                
-                # 點擊查詢按鈕（根據網頁調整 Selector）
+
+                # Click query button
                 page.click('form#queryForm button[type="button"]')
-                
-                # 等待結果區塊顯示（避免硬等待，最多15秒）
+
+                # Wait for result area (max 15s)
                 page.wait_for_selector('#resultArea div table tbody tr td', timeout=15000)
-                
-                # 處理可能彈窗訊息
+
+                # Handle possible popup
                 try:
                     confirm_btn = page.query_selector('ngb-modal-window div.jhi-dialog div button')
                     if confirm_btn:
                         print("發現錯誤彈窗，點擊確定並重試...")
                         confirm_btn.click()
                         page.reload()
-                        # 這筆會在 retry_generator 再重試
                         continue
                 except Exception:
-                    # 無彈窗跳過
                     pass
-                
-                # 擷取結果文字
+
+                # Get result text
                 info = page.inner_text('#resultArea div table tbody tr td').replace('\n', '')
-                
+
                 insertdate = dt.today().strftime("%Y/%m/%d %H:%M:%S")
-                updatesql('10.10.0.94', 'CLUSER', 'Ucredit7607', 'CL_Daily', 'taxrefundtb', info, psid, pid)
+                updatesql(server, username, password, database, tar_tb, info, psid, pid)
                 print(f"資料更新完成 psid={psid}, pid={pid} : {info} 時間：{insertdate}")
-                
-                page.reload()  # 下一筆前刷新頁面
+
+                page.reload()
 
             except PlaywrightTimeoutError as e:
                 print(f"等待超時，重試 psid={psid}, pid={pid}: {e}")
@@ -118,6 +94,7 @@ def run_playwright():
                 continue
 
         browser.close()
+
 
 if __name__ == "__main__":
     run_playwright()

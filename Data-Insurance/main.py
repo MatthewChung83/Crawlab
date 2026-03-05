@@ -14,7 +14,7 @@ import xml.etree.ElementTree as ET
 import logging
 from config import *
 from etl_func import *
-from dict import *
+
 
 # 設置日誌系統
 logging.basicConfig(

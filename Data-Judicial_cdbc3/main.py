@@ -11,14 +11,15 @@ Judicial cdcb3 sync (non-Scrapy)
 import datetime
 import time
 import json
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
 from bs4 import BeautifulSoup
-import pymssql
 import logging
+
+from config import *
+from etl_func import *
 
 # ============ Logging ============
 LOG_PREFIX = "[JudicialSync]"
@@ -27,42 +28,6 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - " + LOG_PREFIX + " %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-
-# ============ DB helpers ============
-def db_connect(cfg: Dict[str, str]) -> pymssql.Connection:
-    try:
-        conn = pymssql.connect(
-            server=cfg["server"],
-            user=cfg["username"],
-            password=cfg["password"],
-            database=cfg["database"],
-            autocommit=False,
-        )
-        logger.info("DB connected.")
-        return conn
-    except Exception as e:
-        logger.error(f"DB connect failed: {e}")
-        raise
-
-
-def safe_execute(cursor, sql: str, params: Optional[Tuple] = None, max_retry: int = 5):
-    """Deadlock(1205) 自動重試"""
-    for i in range(max_retry):
-        try:
-            cursor.execute(sql, params or ())
-            return
-        except pymssql.OperationalError as e:
-            if hasattr(e, "args") and e.args and "1205" in str(e.args[0]):
-                logger.warning(f"Deadlock detected. retry {i+1}/{max_retry} ...")
-                time.sleep(1 + i * 0.5)
-                continue
-            logger.error(f"SQL operational error: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected SQL error: {e}")
-            raise
-    raise RuntimeError("SQL deadlock retried too many times, abort.")
 
 
 # ============ HTTP helpers ============
@@ -89,130 +54,24 @@ def build_session() -> requests.Session:
 
 # ============ Domain logic ============
 class JudicialSync:
-    db = {
-        "server": "10.10.0.94",
-        "database": "CL_Daily",
-        "username": "CLUSER",
-        "password": "Ucredit7607",
-        "fromtb": "base_case",
-        "totb": "Judicial_cdcb3",
-    }
-
-    wbinfo = {
-        "query_url": "https://cdcb3.judicial.gov.tw/judbp/wkw/WHD9A01/QUERY.htm",
-        "view_url": "https://cdcb3.judicial.gov.tw/judbp/wkw/WHD9A01/VIEW.htm",
-        "token_url": "https://cdcb3.judicial.gov.tw/judbp/wkw/WHD9A01/V2.htm",
-    }
-
     def __init__(self):
         self.session = build_session()
         self.conn = None
         self.cursor = None
         self.today_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.timeout = crawler['timeout']
+        self.daily_limit = crawler['daily_limit']
+        self.delay = crawler['delay']
         logger.info(f"Start sync at {self.today_str}")
-
-    # ---------- SQL snippets ----------
-    def src_obs(self) -> int:
-        """
-        計算需處理數量：
-        - base_case 在目標表尚未存在的
-        + 目標表已存在且 update_date 距今 >= 3 個月
-        """
-        sql = f"""
-        SELECT
-          (SELECT COUNT(*)
-             FROM {self.db['fromtb']} b
-             LEFT JOIN [{self.db['totb']}] r ON b.ID = r.ID
-             WHERE r.ID IS NULL)
-          +
-          (SELECT COUNT(*)
-             FROM [{self.db['totb']}]
-             WHERE DATEDIFF(MONTH, update_date, GETDATE()) >= 3)
-        """
-        safe_execute(self.cursor, sql)
-        n = self.cursor.fetchone()[0]
-        logger.info(f"Tasks to process (src_obs) = {n}")
-        return int(n or 0)
-
-    def dbfrom(self) -> Optional[Tuple]:
-        """
-        取一筆要查的身分證資料（優先：目標表沒有的，再來是 >3 個月未更新的）
-        注意：OFFSET/FETCH 需要 ORDER BY，這裡使用 flg desc, rowid ASC。
-        """
-        sql = f"""
-        IF OBJECT_ID('tempdb..#test') IS NOT NULL DROP TABLE #test;
-
-        SELECT
-            b.personi,
-            b.ID,
-            CAST(b.name AS NVARCHAR(200)) AS name,
-            b.casei,
-            b.type,
-            b.c,
-            b.m,
-            b.age,
-            b.flg,
-            r.rowid,
-            b.client_flg
-        INTO #test
-        FROM {self.db['fromtb']} b
-        LEFT JOIN [{self.db['totb']}] r ON b.ID = r.ID
-        WHERE r.ID IS NULL;
-
-        INSERT INTO #test
-        SELECT DISTINCT
-            0 AS personi,
-            ID,
-            CAST(name AS NVARCHAR(200)) AS name,
-            0 AS casei, 0 AS type, 0 AS c, 0 AS m, 0 AS age,
-            '' AS flg,
-            rowid,
-            '1' AS client_flg
-        FROM [{self.db['totb']}]
-        WHERE DATEDIFF(MONTH, update_date, GETDATE()) >= 3;
-
-        SELECT TOP 1 *
-        FROM #test
-        ORDER BY flg DESC, rowid ASC;
-        """
-        safe_execute(self.cursor, sql)
-        row = self.cursor.fetchone()
-        return row
-
-    def delete_row(self, totb: str, ID: str, rowid: str):
-        sql = f"DELETE FROM [{totb}] WHERE ID=%s AND rowid=%s"
-        safe_execute(self.cursor, sql, (ID, rowid))
-
-    def exit_obs(self) -> int:
-        """
-        今日已處理的 ID 數（限制 5000）
-        """
-        sql = f"""
-        SELECT COUNT(DISTINCT ID)
-        FROM [{self.db['totb']}]
-        WHERE CAST(update_date AS date) = CAST(GETDATE() AS date)
-        """
-        safe_execute(self.cursor, sql)
-        n = self.cursor.fetchone()[0]
-        return int(n or 0)
-
-    def toSQL(self, docs: List[Dict[str, Any]]):
-        # 參數化插入
-        keys = list(docs[0].keys())
-        cols = ",".join(f"[{k}]" for k in keys)
-        vals = ",".join(["%s"] * len(keys))
-        sql = f"INSERT INTO [{self.db['totb']}] ({cols}) VALUES ({vals})"
-        data = [tuple(d[k] for k in keys) for d in docs]
-        self.cursor.executemany(sql, data)
 
     # ---------- HTTP scraping ----------
     def get_token(self) -> Optional[str]:
         try:
             headers = {
-                "Referer": self.wbinfo["token_url"],
+                "Referer": wbinfo["token_url"],
                 "Origin": "https://cdcb3.judicial.gov.tw",
             }
-            r = self.session.post(self.wbinfo["token_url"], headers=headers, timeout=30)
+            r = self.session.post(wbinfo["token_url"], headers=headers, timeout=self.timeout)
             if r.status_code != 200:
                 logger.error(f"token page status {r.status_code}")
                 return None
@@ -232,7 +91,7 @@ class JudicialSync:
     def query_list(self, token: str, ID: str) -> Optional[Dict[str, Any]]:
         try:
             headers = {
-                "Referer": self.wbinfo["token_url"],
+                "Referer": wbinfo["token_url"],
                 "Origin": "https://cdcb3.judicial.gov.tw",
             }
             data = {
@@ -248,7 +107,7 @@ class JudicialSync:
                 "token": token,
                 "condition": "undefined",
             }
-            r = self.session.post(self.wbinfo["query_url"], headers=headers, data=data, timeout=45)
+            r = self.session.post(wbinfo["query_url"], headers=headers, data=data, timeout=self.timeout)
             if r.status_code != 200:
                 logger.error(f"query_list status {r.status_code} for ID={ID}")
                 return None
@@ -280,7 +139,7 @@ class JudicialSync:
                 "condition": f"法院別: 全部法院, 公告類型: 消債事件公告, 身分證字號:{ID}",
                 "isDialog": "Y",
             }
-            r = self.session.post(self.wbinfo["view_url"], data=data1, timeout=45)
+            r = self.session.post(wbinfo["view_url"], data=data1, timeout=self.timeout)
             if r.status_code != 200:
                 logger.warning(f"view_basis status {r.status_code} (crtid={crtid})")
                 return ""
@@ -332,17 +191,17 @@ class JudicialSync:
     def run(self):
         try:
             # DB
-            self.conn = db_connect(self.db)
+            self.conn = db_connect(db)
             self.cursor = self.conn.cursor()
-            tasks = self.src_obs()
+            tasks = src_obs(self.cursor, db['fromtb'], db['totb'])
             if tasks <= 0:
                 logger.info("No tasks. Exit.")
                 return
 
             # throttle: 每日上限
-            processed_today = self.exit_obs()
-            if processed_today >= 5000:
-                logger.info("Daily limit (5000) reached. Exit.")
+            processed_today = exit_obs(self.cursor, db['totb'])
+            if processed_today >= self.daily_limit:
+                logger.info(f"Daily limit ({self.daily_limit}) reached. Exit.")
                 return
 
             # time cutoff: 12:00:00 前運行
@@ -354,9 +213,9 @@ class JudicialSync:
 
             for _ in range(tasks):
                 # 每迭代檢查每日上限與時間限制
-                processed_today = self.exit_obs()
-                if processed_today >= 5000:
-                    logger.info("Daily limit (5000) reached. Stop loop.")
+                processed_today = exit_obs(self.cursor, db['totb'])
+                if processed_today >= self.daily_limit:
+                    logger.info(f"Daily limit ({self.daily_limit}) reached. Stop loop.")
                     break
 
                 now = datetime.datetime.now()
@@ -364,7 +223,7 @@ class JudicialSync:
                     logger.info(f"Stop by time cutoff. now={now}, cutoff={cutoff}")
                     break
 
-                row = self.dbfrom()
+                row = dbfrom(self.cursor, db['fromtb'], db['totb'])
                 if not row:
                     logger.info("No candidate row. Done.")
                     break
@@ -391,7 +250,7 @@ class JudicialSync:
                     # 視為查無資料
                     logger.info(f"No dataList for ID={ID}. Insert empty-note record.")
                     if rowid:
-                        self.delete_row(self.db["totb"], ID, rowid)
+                        delete_row(self.cursor, db["totb"], ID, rowid)
                     docs.append(self.build_doc_tuple(
                         ID, name, "", "", "", "", "", "", "", "", "",
                         "", "", "", "", "", "", today_str, "N", ""
@@ -401,7 +260,7 @@ class JudicialSync:
                     if len(data_list) == 0:
                         logger.info(f"Empty dataList for ID={ID}. Insert N record.")
                         if rowid:
-                            self.delete_row(self.db["totb"], ID, rowid)
+                            delete_row(self.cursor, db["totb"], ID, rowid)
                         docs.append(self.build_doc_tuple(
                             ID, name, "", "", "", "", "", "", "", "", "",
                             "", "", "", "", "", "", today_str, "N", ""
@@ -409,7 +268,7 @@ class JudicialSync:
                     else:
                         # 有資料，逐筆寫入（若目標表已有舊 rowid，先刪除）
                         if rowid:
-                            self.delete_row(self.db["totb"], ID, rowid)
+                            delete_row(self.cursor, db["totb"], ID, rowid)
 
                         for i, rec in enumerate(data_list):
                             crtid = str(rec.get("crtid") or "")
@@ -451,9 +310,9 @@ class JudicialSync:
 
                 try:
                     if docs:
-                        self.toSQL(docs)
+                        toSQL(self.cursor, db['totb'], docs)
                         self.conn.commit()
-                        logger.info(f"ID={ID} inserted {len(docs)} row(s). Total today={self.exit_obs()}")
+                        logger.info(f"ID={ID} inserted {len(docs)} row(s). Total today={exit_obs(self.cursor, db['totb'])}")
                 except Exception as e:
                     logger.error(f"DB write failed for ID={ID}: {e}")
                     try:
@@ -464,7 +323,7 @@ class JudicialSync:
                     continue
 
                 # 輕微節流
-                time.sleep(0.2)
+                time.sleep(self.delay)
 
             logger.info("Sync finished.")
         finally:
@@ -478,6 +337,11 @@ class JudicialSync:
 
 
 def main():
+    print("司法院消債事件公告同步程式")
+    print("=" * 50)
+    print(f"資料庫: {db['server']}.{db['database']}")
+    print(f"目標資料表: {db['totb']}")
+
     job = JudicialSync()
     job.run()
 
