@@ -1,0 +1,9 @@
+# 改進版法院拍賣爬蟲所需套件
+requests==2.31.0
+pdfplumber==0.9.0
+python-dateutil==2.8.2
+pymssql==2.2.8
+typing_extensions==4.7.1
+
+# 可選套件 (用於更好的日誌和錯誤處理)
+colorlog==6.7.0

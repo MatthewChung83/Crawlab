@@ -1,0 +1,2 @@
+/tmp/HAMS/HAMS_2026.mdb
+/tmp/HAMS/HAMS.mdb
