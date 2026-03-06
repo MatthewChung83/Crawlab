@@ -1,0 +1,38 @@
+# Crawlab 爬蟲專案依賴
+
+# Web 爬取
+requests>=2.28.0
+beautifulsoup4>=4.11.0
+playwright>=1.40.0
+selenium>=4.0.0
+
+# OCR
+ddddocr>=1.4.0
+Pillow>=9.0.0
+
+# PDF 處理
+pdfplumber>=0.7.0
+fpdf>=1.7.0
+
+# 資料處理
+pandas>=1.5.0
+chardet>=5.0.0
+regex>=2022.0.0
+
+# 資料庫
+pymssql>=2.2.0
+pyodbc>=4.0.0
+
+# 網路與檔案傳輸
+paramiko>=2.11.0
+scp>=0.14.0
+pysmb>=1.2.0
+urllib3>=1.26.0
+
+# API Gateway (選用)
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+
+# 其他
+python-dateutil>=2.8.0
