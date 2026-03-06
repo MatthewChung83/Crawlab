@@ -1,26 +1,31 @@
 # -*- coding: utf-8 -*-
 """
 HR-EMP - Employee data sync from HR API to database
+員工資料同步
 """
+import os
+import sys
 import datetime
-import logging
+
+# Add parent directory to path for common module
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import *
 from etl_func import (
     get_database_connection, safe_execute, get_existing_employees,
     login, fetch_employee_data, safe_str, get_empstatus, get_leftdate
 )
+from common.logger import get_logger
 
-# 設置日誌
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Initialize logger
+logger = get_logger('HR-EMP')
 
 
 def process_employee_data(datatable, existing_employees):
     """處理員工資料並更新資料庫"""
     if not datatable:
         logger.warning("No employee data to process")
-        return
+        return 0, 0, 0
 
     insert_count = 0
     update_count = 0
@@ -50,9 +55,12 @@ def process_employee_data(datatable, existing_employees):
         """
 
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        total_records = len(datatable)
 
-        for raw in datatable:
+        for idx, raw in enumerate(datatable, 1):
             try:
+                logger.log_progress(idx, total_records, f"employee_{idx}")
+
                 # 正規化鍵名 -> 全大寫
                 employee_data = {(k.upper() if isinstance(k, str) else k): v for k, v in raw.items()}
 
@@ -73,7 +81,10 @@ def process_employee_data(datatable, existing_employees):
                 empstatus = get_empstatus(raw_status)
                 leftdate = get_leftdate(empstatus, employee_data)
 
+                logger.ctx.set_data(emp_id=emp_id, cname=cname)
+
                 if emp_id in existing_employees:
+                    logger.ctx.set_operation("update_employee")
                     params = (
                         name, cname, department, now_str,
                         costcenter, empstatus, joblevel,
@@ -82,7 +93,9 @@ def process_employee_data(datatable, existing_employees):
                     )
                     safe_execute(cursor, update_sql, params)
                     update_count += 1
+                    logger.increment('records_updated')
                 else:
+                    logger.ctx.set_operation("insert_employee")
                     params = (
                         emp_id, name, cname, department, costcenter,
                         empstatus, joblevel, leftdate, company, ins_dat,
@@ -90,14 +103,18 @@ def process_employee_data(datatable, existing_employees):
                     )
                     safe_execute(cursor, insert_sql, params)
                     insert_count += 1
+                    logger.increment('records_inserted')
 
             except Exception as e:
                 error_count += 1
-                logger.error(f"Error processing employee {raw.get('SYS_VIEWID', 'unknown')}: {e}")
+                logger.increment('records_failed')
+                logger.warning(f"Error processing employee {raw.get('SYS_VIEWID', 'unknown')}: {e}")
                 continue
 
         conn.commit()
-        logger.info(f'員工資料同步完成 - 總筆數: {update_count + insert_count}, 更新: {update_count}, 新增: {insert_count}, 錯誤: {error_count}')
+        logger.info(f'員工資料處理完成 - 總筆數: {update_count + insert_count}, 更新: {update_count}, 新增: {insert_count}, 錯誤: {error_count}')
+
+        return insert_count, update_count, error_count
 
     except Exception as e:
         if conn:
@@ -105,7 +122,7 @@ def process_employee_data(datatable, existing_employees):
                 conn.rollback()
             except Exception:
                 pass
-        logger.error(f"Database transaction failed: {e}")
+        logger.log_exception(e, "Database transaction failed")
         raise
     finally:
         if cursor:
@@ -116,45 +133,72 @@ def process_employee_data(datatable, existing_employees):
 
 def run():
     """執行完整的同步流程"""
-    getdate = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    logger.info(f'員工資料同步-起始時間: {getdate}')
+    logger.task_start("員工資料同步")
 
     try:
         # 1. 登入 API
+        logger.ctx.set_operation("api_login")
         session_id = login()
         if not session_id:
             logger.error("Failed to login to API")
+            logger.task_end(success=False)
             return False
 
+        logger.info("API 登入成功")
+
         # 2. 取得現有員工資料
+        logger.ctx.set_operation("get_existing_employees")
         conn = get_database_connection()
         existing_employees = get_existing_employees(conn)
         conn.close()
-        logger.info(f"Found {len(existing_employees)} existing employees in database")
+        logger.info(f"現有員工數: {len(existing_employees)}")
 
         # 3. 從 API 取得員工資料
+        logger.ctx.set_operation("fetch_employee_data")
         datatable = fetch_employee_data(session_id)
         if not datatable:
             logger.error("No employee data retrieved from API")
+            logger.task_end(success=False)
             return False
 
+        logger.info(f"從 API 取得員工資料: {len(datatable)} 筆")
+
         # 4. 處理並更新資料庫
-        process_employee_data(datatable, existing_employees)
+        logger.ctx.set_operation("process_employee_data")
+        insert_count, update_count, error_count = process_employee_data(datatable, existing_employees)
 
-        # 5. 記錄結束時間
-        end_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        logger.info(f'員工資料同步-結束時間: {end_time}')
+        logger.log_stats({
+            'total_from_api': len(datatable),
+            'existing_employees': len(existing_employees),
+            'inserted': insert_count,
+            'updated': update_count,
+            'errors': error_count,
+        })
 
-        return True
+        logger.task_end(success=(error_count == 0))
+        return error_count == 0
 
     except Exception as e:
-        logger.error(f"Sync process failed: {e}")
+        logger.log_exception(e, "Sync process failed")
+        logger.task_end(success=False)
         return False
 
 
+def main():
+    """Main entry point"""
+    logger.info("HR-EMP 員工資料同步")
+
+    try:
+        success = run()
+        if success:
+            logger.info("同步完成")
+        else:
+            logger.warning("同步失敗")
+    except KeyboardInterrupt:
+        logger.warning("使用者中斷操作")
+    except Exception as e:
+        logger.log_exception(e, "程式執行錯誤")
+
+
 if __name__ == "__main__":
-    success = run()
-    if success:
-        logger.info("Employee data sync completed successfully")
-    else:
-        logger.error("Employee data sync failed")
+    main()

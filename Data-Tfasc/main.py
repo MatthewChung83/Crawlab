@@ -7,7 +7,9 @@ import os
 import sys
 import datetime
 import argparse
-import traceback
+
+# Add parent directory to path for common module
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import db, doc_download
 from etl_func import (
@@ -16,94 +18,220 @@ from etl_func import (
     dbfrom_doc_download, download_document
 )
 from utils import parseBulletin, parseSection
+from common.logger import get_logger
+
+# Initialize logger
+logger = get_logger('Data-Tfasc')
 
 
 def run_crawler(mode='prod'):
     """Run the main auction data crawler"""
+    logger.task_start("金服中心拍賣資料爬取")
+
     server = db['server']
     database = db['database']
     username = db['username']
     password = db['password']
 
-    print("開始解析場次資料...")
-    tfasc = parseSection(mode)
-    print(f"取得 {len(tfasc)} 筆場次資料")
+    logger.log_db_connect(server, database, username)
+    logger.info(f"執行模式: {mode}")
+
+    # Parse section data
+    logger.ctx.set_operation("parse_section")
+    logger.info("開始解析場次資料...")
+
+    try:
+        tfasc = parseSection(mode)
+        logger.info(f"取得 {len(tfasc)} 筆場次資料")
+    except Exception as e:
+        logger.log_exception(e, "解析場次資料失敗")
+        logger.task_end(success=False)
+        return False
 
     if not tfasc:
-        print("沒有取得任何場次資料，程式結束")
-        return
+        logger.warning("沒有取得任何場次資料")
+        logger.task_end(success=True)
+        return True
 
-    print("篩選未處理的案件...")
+    # Filter unprocessed cases
+    logger.ctx.set_operation("filter_cases")
+    logger.info("篩選未處理的案件...")
+
     tfascs = []
-    for t in tfasc:
+    total_cases = len(tfasc)
+    for idx, t in enumerate(tfasc, 1):
+        logger.ctx.set_progress(idx, total_cases)
         try:
             if '金服案號' not in t or 'session' not in t:
-                print(f"跳過缺少必要欄位的資料: {t}")
+                logger.debug(f"跳過缺少必要欄位的資料: {t.get('金服案號', 'unknown')}")
                 continue
 
+            logger.ctx.set_data(case_no=t['金服案號'], session=t['session'])
             if exist_number(t['金服案號'], t['session']) == 0:
                 tfascs.append(t)
         except Exception as e:
-            print(f"檢查案件 {t.get('金服案號', 'unknown')} 時發生錯誤: {e}")
+            logger.log_exception(e, f"檢查案件時發生錯誤: case_no={t.get('金服案號', 'unknown')}")
             continue
 
-    print(f"篩選出 {len(tfascs)} 筆新案件")
-    if not tfascs:
-        print("沒有新的案件需要處理，程式結束")
-        return
+    logger.info(f"篩選出 {len(tfascs)} 筆新案件")
 
-    print("開始解析公告內容...")
-    result = parseBulletin(tfascs, mode)
-    print(f"成功解析 {len(result)} 筆公告資料")
+    if not tfascs:
+        logger.info("沒有新的案件需要處理")
+        logger.task_end(success=True)
+        return True
+
+    # Parse bulletin content
+    logger.ctx.set_operation("parse_bulletin")
+    logger.info("開始解析公告內容...")
+
+    try:
+        result = parseBulletin(tfascs, mode)
+        logger.info(f"成功解析 {len(result)} 筆公告資料")
+    except Exception as e:
+        logger.log_exception(e, "解析公告內容失敗")
+        logger.task_end(success=False)
+        return False
 
     if not result:
-        print("沒有成功解析的資料，程式結束")
-        return
+        logger.warning("沒有成功解析的資料")
+        logger.task_end(success=True)
+        return True
 
-    print("開始進行資料轉換...")
-    auction_info_owner_data = auction_info_owner_tb_etl(result)
-    auction_info_data = auction_info_tb_etl(result)
-    wbt_tfasc_auction_data = wbt_tfasc_auction_tb_etl(result)
+    # Data transformation
+    logger.ctx.set_operation("data_transform")
+    logger.info("開始進行資料轉換...")
 
-    print(f"轉換結果 - 所有權人: {len(auction_info_owner_data)}, 拍賣資訊: {len(auction_info_data)}, 主表: {len(wbt_tfasc_auction_data)}")
+    try:
+        auction_info_owner_data = auction_info_owner_tb_etl(result)
+        auction_info_data = auction_info_tb_etl(result)
+        wbt_tfasc_auction_data = wbt_tfasc_auction_tb_etl(result)
 
-    print("開始寫入資料庫...")
-    if len(auction_info_owner_data) > 0:
-        print("寫入所有權人資料...")
-        toSQL(auction_info_owner_data, db['auction_owner_tb'], server, database, username, password)
-    if len(auction_info_data) > 0:
-        print("寫入拍賣資訊資料...")
-        toSQL(auction_info_data, db['auction_info_tb'], server, database, username, password)
-    if len(wbt_tfasc_auction_data) > 0:
-        print("寫入主表資料...")
-        toSQL(wbt_tfasc_auction_data, db['wbt_auction_tb'], server, database, username, password)
+        logger.info(f"轉換結果 - 所有權人: {len(auction_info_owner_data)}, "
+                   f"拍賣資訊: {len(auction_info_data)}, 主表: {len(wbt_tfasc_auction_data)}")
+    except Exception as e:
+        logger.log_exception(e, "資料轉換失敗")
+        logger.task_end(success=False)
+        return False
 
-    print("爬蟲執行完成！")
+    # Write to database
+    logger.ctx.set_operation("DB_insert")
+    logger.info("開始寫入資料庫...")
+
+    try:
+        if len(auction_info_owner_data) > 0:
+            logger.ctx.set_db(server=server, database=database,
+                            table=db['auction_owner_tb'], operation="INSERT")
+            toSQL(auction_info_owner_data, db['auction_owner_tb'], server, database, username, password)
+            logger.log_db_operation("INSERT", database, db['auction_owner_tb'], len(auction_info_owner_data))
+
+        if len(auction_info_data) > 0:
+            logger.ctx.set_db(server=server, database=database,
+                            table=db['auction_info_tb'], operation="INSERT")
+            toSQL(auction_info_data, db['auction_info_tb'], server, database, username, password)
+            logger.log_db_operation("INSERT", database, db['auction_info_tb'], len(auction_info_data))
+
+        if len(wbt_tfasc_auction_data) > 0:
+            logger.ctx.set_db(server=server, database=database,
+                            table=db['wbt_auction_tb'], operation="INSERT")
+            toSQL(wbt_tfasc_auction_data, db['wbt_auction_tb'], server, database, username, password)
+            logger.log_db_operation("INSERT", database, db['wbt_auction_tb'], len(wbt_tfasc_auction_data))
+
+    except Exception as e:
+        logger.log_db_error(e, "INSERT")
+        logger.task_end(success=False)
+        return False
+
+    logger.log_stats({
+        'total_sections': len(tfasc),
+        'new_cases': len(tfascs),
+        'parsed_bulletins': len(result),
+        'owner_records': len(auction_info_owner_data),
+        'info_records': len(auction_info_data),
+        'main_records': len(wbt_tfasc_auction_data),
+    })
+
+    logger.task_end(success=True)
+    return True
 
 
 def run_doc_download(days_back=10):
     """Download auction documents as PDF"""
+    logger.task_start("金服中心文件下載")
+
     server = db['server']
     database = db['database']
     username = db['username']
     password = db['password']
     output_dir = doc_download['output_dir']
 
+    logger.log_db_connect(server, database, username)
+    logger.info(f"輸出目錄: {output_dir}")
+    logger.info(f"查詢天數: {days_back} 天")
+
+    # Get document list from database
+    logger.ctx.set_operation("DB_query_documents")
     yesterday = datetime.date.today() + datetime.timedelta(days=-days_back)
-    src_list = dbfrom_doc_download(server, username, password, database, yesterday)
 
-    print(f"找到 {len(src_list)} 筆文件需要下載")
+    try:
+        src_list = dbfrom_doc_download(server, username, password, database, yesterday)
+        logger.info(f"找到 {len(src_list)} 筆文件需要下載")
+    except Exception as e:
+        logger.log_db_error(e, "SELECT")
+        logger.task_end(success=False)
+        return False
 
-    for filename, url in src_list:
+    if not src_list:
+        logger.info("沒有文件需要下載")
+        logger.task_end(success=True)
+        return True
+
+    # Download documents
+    logger.ctx.set_operation("download_documents")
+    success_count = 0
+    fail_count = 0
+    total_docs = len(src_list)
+
+    for idx, (filename, url) in enumerate(src_list, 1):
+        logger.log_progress(idx, total_docs, filename)
+        logger.ctx.set_data(filename=filename, url=url)
+
         full_path = os.path.join(output_dir, filename)
+
         try:
+            logger.log_request("GET", url, None, None)
             download_document(url, full_path)
-            print(f"已下載: {full_path}")
+            logger.info(f"下載成功: {filename}")
+            success_count += 1
+            logger.increment('records_success')
         except Exception as e:
-            print(f"[ERROR] 下載失敗 {filename}: {e}")
+            logger.log_exception(e, f"下載失敗: {filename}")
+            fail_count += 1
+            logger.increment('records_failed')
             continue
 
-    print("文件下載完成！")
+    logger.log_stats({
+        'total_documents': total_docs,
+        'success': success_count,
+        'failed': fail_count,
+    })
+
+    logger.task_end(success=(fail_count == 0))
+    return fail_count == 0
+
+
+def run(mode='prod', action='all', days=10):
+    """Main execution function"""
+    success = True
+
+    if action in ['crawl', 'all']:
+        if not run_crawler(mode):
+            success = False
+
+    if action in ['download', 'all']:
+        if not run_doc_download(days):
+            success = False
+
+    return success
 
 
 if __name__ == "__main__":
@@ -115,13 +243,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
-        if args.action in ['crawl', 'all']:
-            run_crawler(args.mode)
-
-        if args.action in ['download', 'all']:
-            run_doc_download(args.days)
-
+        success = run(mode=args.mode, action=args.action, days=args.days)
+        sys.exit(0 if success else 1)
     except Exception as e:
-        print(f"程式執行過程中發生錯誤: {e}")
-        traceback.print_exc()
+        logger.log_exception(e, "程式執行過程中發生錯誤")
         sys.exit(1)

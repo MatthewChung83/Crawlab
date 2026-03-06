@@ -12,6 +12,8 @@
 6. 重複執行檢查機制
 """
 
+import os
+import sys
 import requests
 import re
 import time
@@ -20,8 +22,15 @@ import warnings
 from bs4 import BeautifulSoup
 from datetime import datetime
 
+# Add parent directory to path for common module
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from config import *
 from etl_func import *
+from common.logger import get_logger
+
+# Initialize logger
+logger = get_logger('Data-Judicial_139')
 
 # 禁用SSL警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -120,20 +129,35 @@ class JudicialCrawler:
 
     def get_initial_page(self):
         """獲取初始頁面token"""
+        logger.ctx.set_operation("get_token")
         try:
+            start_time = time.time()
+            logger.log_request("GET", self.base_url, self.session.headers, None)
+
             response = self.session.get(self.base_url, timeout=self.timeout)
+            elapsed = time.time() - start_time
+
+            logger.log_response(response.status_code, dict(response.headers), f"[HTML: {len(response.text)} chars]", elapsed)
             response.raise_for_status()
 
             soup = BeautifulSoup(response.text, 'html.parser')
             token_input = soup.find('input', {'name': 'lstoken'})
 
-            return token_input.get('value') if token_input else None
+            token = token_input.get('value') if token_input else None
+            if token:
+                logger.debug(f"取得 token: {token[:20]}...")
+            else:
+                logger.warning("未找到 token")
+            return token
         except Exception as e:
-            print(f"獲取初始頁面失敗: {e}")
+            logger.log_exception(e, "獲取初始頁面失敗")
             return None
 
     def scrape_single_page(self, start_date, end_date, page_num=1):
         """抓取單頁資料"""
+        logger.ctx.set_operation("scrape_page")
+        logger.ctx.set_data(page=page_num, start_date=start_date, end_date=end_date)
+
         lstoken = self.get_initial_page() or "1749801548"
 
         form_data = {
@@ -152,17 +176,30 @@ class JudicialCrawler:
         }
 
         try:
+            start_time = time.time()
             if page_num == 1:
+                logger.log_request("POST", self.base_url, self.session.headers, form_data)
                 response = self.session.post(self.base_url, data=form_data, timeout=self.timeout)
             else:
                 page_url = f"https://www.judicial.gov.tw/tw/lp-139-1-{page_num}-{self.page_size}.html"
+                logger.log_request("GET", page_url, self.session.headers, None)
                 response = self.session.get(page_url, timeout=self.timeout)
+
+            elapsed = time.time() - start_time
+            logger.log_response(response.status_code, dict(response.headers), f"[HTML: {len(response.text)} chars]", elapsed)
 
             response.raise_for_status()
             return self.parse_page_results(response.text)
 
+        except requests.exceptions.Timeout as e:
+            logger.log_http_error(e, self.base_url)
+            logger.error(f"第 {page_num} 頁請求超時")
+            return [], 1
+        except requests.exceptions.RequestException as e:
+            logger.log_http_error(e, self.base_url)
+            return [], 1
         except Exception as e:
-            print(f"第 {page_num} 頁抓取失敗: {e}")
+            logger.log_exception(e, f"第 {page_num} 頁抓取失敗")
             return [], 1
 
     def parse_page_results(self, html_content):
@@ -207,14 +244,14 @@ class JudicialCrawler:
                 except:
                     continue
 
-        print(f"本頁找到 {len(results)} 筆記錄，總頁數: {max_page}")
+        logger.debug(f"本頁找到 {len(results)} 筆記錄，總頁數: {max_page}")
         return results, max_page
 
     def process_data(self, raw_data):
         """處理原始資料"""
         processed_data = []
 
-        print(f"正在處理 {len(raw_data)} 筆原始資料...")
+        logger.debug(f"正在處理 {len(raw_data)} 筆原始資料...")
 
         for item in raw_data:
             # 跳過表頭
@@ -247,17 +284,17 @@ class JudicialCrawler:
 
             processed_data.append(record)
 
-        print(f"資料處理完成！共處理 {len(processed_data)} 筆有效記錄")
+        logger.debug(f"資料處理完成！共處理 {len(processed_data)} 筆有效記錄")
         return processed_data
 
     def scrape_and_save_page_data(self, start_date, end_date, page_num, total_pages):
         """抓取單頁資料並立即處理保存"""
-        print(f"正在抓取第 {page_num}/{total_pages} 頁...", end=" ")
+        logger.log_progress(page_num, total_pages, f"page_{page_num}")
 
         page_results, _ = self.scrape_single_page(start_date, end_date, page_num)
 
         if not page_results:
-            print("失敗")
+            logger.warning(f"第 {page_num} 頁無資料")
             return 0
 
         # 去除表頭
@@ -265,27 +302,31 @@ class JudicialCrawler:
             page_results = page_results[1:]
 
         if not page_results:
-            print("無有效資料")
+            logger.debug(f"第 {page_num} 頁無有效資料")
             return 0
 
         # 立即處理資料
         processed_data = self.process_data(page_results)
         if not processed_data:
-            print("處理失敗")
+            logger.warning(f"第 {page_num} 頁處理失敗")
             return 0
 
         # 立即插入資料庫
+        logger.ctx.set_operation("DB_insert")
+        logger.ctx.set_db(server=db['server'], database=db['database'], table=db['totb'], operation="INSERT")
+
         if insert_data(self.connection, db['totb'], processed_data):
-            print(f"成功 {len(processed_data)} 筆")
+            logger.log_db_operation("INSERT", db['database'], db['totb'], len(processed_data))
+            logger.increment('records_success', len(processed_data))
             return len(processed_data)
         else:
-            print("插入失敗")
+            logger.error(f"第 {page_num} 頁資料插入失敗")
+            logger.increment('records_failed', len(processed_data))
             return 0
 
     def run_complete_process(self, start_date=None, end_date=None):
         """執行完整流程"""
-        print("司法院資料完整抓取程式")
-        print("=" * 60)
+        logger.task_start("司法院公告資料抓取 (139)")
 
         # 使用當天日期如果沒有指定
         if not start_date or not end_date:
@@ -293,19 +334,25 @@ class JudicialCrawler:
             start_date = start_date or current_date
             end_date = end_date or current_date
 
-        print(f"抓取日期範圍: {start_date} 至 {end_date}")
+        logger.info(f"抓取日期範圍: {start_date} 至 {end_date}")
 
         # 1. 連接資料庫
+        logger.ctx.set_operation("DB_connect")
+        logger.log_db_connect(db['server'], db['database'], db['username'])
+
         self.connection = connect_database(
             db['server'], db['username'], db['password'], db['database']
         )
         if not self.connection:
-            print("資料庫連接失敗")
+            logger.error("資料庫連接失敗")
+            logger.task_end(success=False)
             return False
 
         try:
             # 2. 建立資料表 (如果不存在)
             if not create_table_if_not_exists(self.connection, db['totb']):
+                logger.error("建立資料表失敗")
+                logger.task_end(success=False)
                 return False
 
             # 3. 檢查是否已有今天的資料
@@ -313,16 +360,18 @@ class JudicialCrawler:
             western_end = self.convert_taiwan_to_western_date(end_date.replace('/', '-'))
 
             if check_existing_data(self.connection, db['totb'], western_start, western_end):
-                print("檢測到今天已有相同日期範圍的資料，自動繼續新增...")
+                logger.info("檢測到今天已有相同日期範圍的資料，自動繼續新增...")
 
             # 4. 獲取第一頁以確定總頁數
-            print("開始抓取司法院公告資料...")
+            logger.info("開始抓取司法院公告資料...")
             first_page_results, total_pages = self.scrape_single_page(start_date, end_date, 1)
 
             if not first_page_results:
-                print("第一頁抓取失敗")
+                logger.error("第一頁抓取失敗")
+                logger.task_end(success=False)
                 return False
 
+            logger.info(f"總頁數: {total_pages}")
             total_saved = 0
 
             # 5. 處理第一頁
@@ -331,16 +380,11 @@ class JudicialCrawler:
 
             # 6. 抓取其餘頁面
             if total_pages > 1:
-                print(f"總共 {total_pages} 頁，開始抓取剩餘頁面...")
+                logger.info(f"開始抓取剩餘 {total_pages - 1} 頁...")
 
                 for page_num in range(2, total_pages + 1):
                     saved_count = self.scrape_and_save_page_data(start_date, end_date, page_num, total_pages)
                     total_saved += saved_count
-
-                    # 進度顯示
-                    if page_num % 5 == 0:
-                        progress = (page_num / total_pages) * 100
-                        print(f"   進度: {progress:.1f}% | 已儲存: {total_saved} 筆")
 
                     # 延迟避免請求過快
                     time.sleep(self.delay)
@@ -348,36 +392,47 @@ class JudicialCrawler:
             # 7. 驗證資料
             verify_data(self.connection, db['totb'])
 
-            print(f"\n程式執行完成！今天新增 {total_saved} 筆司法院公告記錄")
+            logger.log_stats({
+                'total_pages': total_pages,
+                'total_saved': total_saved,
+            })
+
+            logger.task_end(success=True)
             return True
+
+        except Exception as e:
+            logger.log_exception(e, "執行過程發生錯誤")
+            logger.task_end(success=False)
+            return False
 
         finally:
             # 8. 關閉連接
             if self.connection:
                 self.connection.close()
-                print("資料庫連接已關閉")
+                logger.info("資料庫連接已關閉")
+
+
+def run(start_date=None, end_date=None):
+    """Main execution function"""
+    crawler = JudicialCrawler()
+    return crawler.run_complete_process(start_date, end_date)
 
 
 def main():
     """主程式"""
-    print("司法院公告資料抓取程式")
-    print("=" * 50)
-    print(f"資料庫: {db['server']}.{db['database']}")
-    print(f"目標資料表: {db['totb']}")
-
-    # 建立並執行
-    crawler = JudicialCrawler()
+    logger.info(f"資料庫: {db['server']}.{db['database']}")
+    logger.info(f"目標資料表: {db['totb']}")
 
     try:
-        success = crawler.run_complete_process()
+        success = run()
         if success:
-            print("\n所有操作成功完成！")
+            logger.info("所有操作成功完成！")
         else:
-            print("\n部分操作失敗，請檢查錯誤訊息")
+            logger.warning("部分操作失敗，請檢查錯誤訊息")
     except KeyboardInterrupt:
-        print("\n\n使用者中斷操作")
+        logger.warning("使用者中斷操作")
     except Exception as e:
-        print(f"\n程式執行錯誤: {e}")
+        logger.log_exception(e, "程式執行錯誤")
 
 
 if __name__ == "__main__":

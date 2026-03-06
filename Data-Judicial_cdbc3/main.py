@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Judicial cdcb3 sync (non-Scrapy)
-- 移除 Scrapy 架構
-- 加入可判別 log 前綴 [JudicialSync]
+Judicial cdcb3 sync - 消債事件公告同步
 - requests.Session + Retry 防止 DNS/連線暫失
 - SQL 改為參數化 (%s) + 語法修正
-- 全面例外處理並落點記錄
+- 統一 Log 模組
 """
 
+import os
+import sys
 import datetime
 import time
 import json
@@ -16,22 +16,20 @@ from typing import Dict, Any, List, Optional
 import requests
 from requests.adapters import HTTPAdapter, Retry
 from bs4 import BeautifulSoup
-import logging
+
+# Add parent directory to path for common module
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import *
 from etl_func import *
+from common.logger import get_logger
 
-# ============ Logging ============
-LOG_PREFIX = "[JudicialSync]"
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - " + LOG_PREFIX + " %(message)s"
-)
-logger = logging.getLogger(__name__)
+# Initialize logger
+logger = get_logger('Data-Judicial_cdbc3')
 
 
-# ============ HTTP helpers ============
 def build_session() -> requests.Session:
+    """Build HTTP session with retry"""
     s = requests.Session()
     retries = Retry(
         total=5,
@@ -52,7 +50,6 @@ def build_session() -> requests.Session:
     return s
 
 
-# ============ Domain logic ============
 class JudicialSync:
     def __init__(self):
         self.session = build_session()
@@ -62,33 +59,49 @@ class JudicialSync:
         self.timeout = crawler['timeout']
         self.daily_limit = crawler['daily_limit']
         self.delay = crawler['delay']
-        logger.info(f"Start sync at {self.today_str}")
 
-    # ---------- HTTP scraping ----------
     def get_token(self) -> Optional[str]:
+        """Get CSRF token from page"""
+        logger.ctx.set_operation("get_token")
         try:
             headers = {
                 "Referer": wbinfo["token_url"],
                 "Origin": "https://cdcb3.judicial.gov.tw",
             }
+            start_time = time.time()
+            logger.log_request("POST", wbinfo["token_url"], headers, None)
+
             r = self.session.post(wbinfo["token_url"], headers=headers, timeout=self.timeout)
+            elapsed = time.time() - start_time
+
+            logger.log_response(r.status_code, dict(r.headers), f"[HTML: {len(r.text)} chars]", elapsed)
+
             if r.status_code != 200:
-                logger.error(f"token page status {r.status_code}")
+                logger.error(f"token 頁面狀態碼: {r.status_code}")
                 return None
+
             soup = BeautifulSoup(r.text, "lxml")
             node = soup.select_one("input[name=token]")
             if not node or not node.get("value"):
-                logger.error("token not found in page.")
+                logger.error("token 未找到")
                 return None
-            return node.get("value")
+
+            token = node.get("value")
+            logger.debug(f"取得 token: {token[:20]}...")
+            return token
+
         except requests.exceptions.RequestException as e:
-            logger.error(f"token request failed: {e}")
+            logger.log_http_error(e, wbinfo["token_url"])
             return None
         except Exception as e:
-            logger.error(f"token parse failed: {e}")
+            logger.log_exception(e, "token 解析失敗")
             return None
 
     def query_list(self, token: str, ID: str) -> Optional[Dict[str, Any]]:
+        """Query data list for ID"""
+        logger.ctx.set_operation("query_list")
+        logger.ctx.set_data(ID=ID)
+
         try:
             headers = {
                 "Referer": wbinfo["token_url"],
@@ -107,31 +120,38 @@ class JudicialSync:
                 "token": token,
                 "condition": "undefined",
             }
+
+            start_time = time.time()
+            logger.log_request("POST", wbinfo["query_url"], headers, data)
+
             r = self.session.post(wbinfo["query_url"], headers=headers, data=data, timeout=self.timeout)
+            elapsed = time.time() - start_time
+
+            logger.log_response(r.status_code, dict(r.headers), r.text[:500] if len(r.text) > 500 else r.text, elapsed)
+
             if r.status_code != 200:
-                logger.error(f"query_list status {r.status_code} for ID={ID}")
+                logger.error(f"query_list 狀態碼: {r.status_code}, ID={ID}")
                 return None
-            # 介面回傳 JSON 字串，有時嵌在 HTML 中，先取文字後 loads
+
             try:
                 payload = json.loads(r.text)
                 return payload
             except json.JSONDecodeError:
-                # 有時候頁面包 HTML -> 嘗試從 text 抽離
                 soup = BeautifulSoup(r.text, "lxml")
                 txt = soup.text.strip()
                 payload = json.loads(txt)
                 return payload
+
         except requests.exceptions.RequestException as e:
-            logger.error(f"query_list request failed for ID={ID}: {e}")
+            logger.log_http_error(e, wbinfo["query_url"])
             return None
         except Exception as e:
-            logger.error(f"query_list parse failed for ID={ID}: {e}")
+            logger.log_exception(e, f"query_list 解析失敗, ID={ID}")
             return None
 
     def view_basis(self, crtid: str, filenm: str, ID: str) -> str:
-        """
-        讀 VIEW.htm 取得事實摘要(Basis)。若超長或失敗回空字串。
-        """
+        """Get case basis (事實摘要)"""
+        logger.ctx.set_operation("view_basis")
         try:
             data1 = {
                 "crtid": crtid,
@@ -139,24 +159,33 @@ class JudicialSync:
                 "condition": f"法院別: 全部法院, 公告類型: 消債事件公告, 身分證字號:{ID}",
                 "isDialog": "Y",
             }
+
+            start_time = time.time()
+            logger.log_request("POST", wbinfo["view_url"], None, data1)
+
             r = self.session.post(wbinfo["view_url"], data=data1, timeout=self.timeout)
+            elapsed = time.time() - start_time
+
+            logger.log_response(r.status_code, dict(r.headers), f"[HTML: {len(r.text)} chars]", elapsed)
+
             if r.status_code != 200:
-                logger.warning(f"view_basis status {r.status_code} (crtid={crtid})")
+                logger.warning(f"view_basis 狀態碼: {r.status_code}, crtid={crtid}")
                 return ""
+
             soup2 = BeautifulSoup(r.text.replace("</br>", "").replace("<br/>", ""), "lxml")
             tds = soup2.find_all("td")
             if len(tds) >= 4:
                 text = tds[3].get_text(separator="", strip=True)
                 return text if len(text) <= 4000 else ""
             return ""
+
         except requests.exceptions.RequestException as e:
-            logger.warning(f"view_basis request failed: {e}")
+            logger.log_http_error(e, wbinfo["view_url"])
             return ""
         except Exception as e:
-            logger.warning(f"view_basis parse failed: {e}")
+            logger.warning(f"view_basis 解析失敗: {e}")
             return ""
 
-    # ---------- record build ----------
     @staticmethod
     def build_doc_tuple(
         ID: str, name: str, crtid: str, sys: str, crmyy: str, crmid: str, crmno: str,
@@ -187,58 +216,72 @@ class JudicialSync:
             "filename": filename,
         }
 
-    # ---------- main flow ----------
     def run(self):
+        """Main execution"""
+        logger.task_start("消債事件公告同步 (cdbc3)")
+
         try:
-            # DB
+            # DB connect
+            logger.ctx.set_operation("DB_connect")
+            logger.log_db_connect(db['server'], db['database'], db['username'])
+
             self.conn = db_connect(db)
             self.cursor = self.conn.cursor()
-            tasks = src_obs(self.cursor, db['fromtb'], db['totb'])
-            if tasks <= 0:
-                logger.info("No tasks. Exit.")
-                return
 
-            # throttle: 每日上限
+            tasks = src_obs(self.cursor, db['fromtb'], db['totb'])
+            logger.info(f"待處理筆數: {tasks}")
+
+            if tasks <= 0:
+                logger.info("沒有待處理的任務")
+                logger.task_end(success=True)
+                return True
+
+            # Check daily limit
             processed_today = exit_obs(self.cursor, db['totb'])
             if processed_today >= self.daily_limit:
-                logger.info(f"Daily limit ({self.daily_limit}) reached. Exit.")
-                return
+                logger.info(f"已達每日上限 ({self.daily_limit})")
+                logger.task_end(success=True)
+                return True
 
-            # time cutoff: 12:00:00 前運行
+            # Time cutoff: 12:00:00
             now = datetime.datetime.now()
             cutoff = now.replace(hour=11, minute=59, second=59, microsecond=0)
             if now > cutoff:
-                logger.info(f"Stop by time cutoff. now={now}, cutoff={cutoff}")
-                return
+                logger.info(f"超過時間限制. now={now}, cutoff={cutoff}")
+                logger.task_end(success=True)
+                return True
 
-            for _ in range(tasks):
-                # 每迭代檢查每日上限與時間限制
+            total_processed = 0
+
+            for task_idx in range(tasks):
+                logger.log_progress(task_idx + 1, tasks, f"task_{task_idx + 1}")
+
+                # Check limits each iteration
                 processed_today = exit_obs(self.cursor, db['totb'])
                 if processed_today >= self.daily_limit:
-                    logger.info(f"Daily limit ({self.daily_limit}) reached. Stop loop.")
+                    logger.info(f"已達每日上限 ({self.daily_limit})")
                     break
 
                 now = datetime.datetime.now()
                 if now > cutoff:
-                    logger.info(f"Stop by time cutoff. now={now}, cutoff={cutoff}")
+                    logger.info(f"超過時間限制")
                     break
 
                 row = dbfrom(self.cursor, db['fromtb'], db['totb'])
                 if not row:
-                    logger.info("No candidate row. Done.")
+                    logger.info("沒有候選記錄")
                     break
 
-                # unpack
-                # personi, ID, name, casei, type, c, m, age, flg, rowid, client_flg
                 ID = str(row[1])
                 name = str(row[2])
                 rowid = ("" if row[9] is None else str(row[9]))
-                logger.info(f"Processing ID={ID} name={name} rowid={rowid}")
+
+                logger.ctx.set_data(ID=ID, name=name, rowid=rowid)
+                logger.info(f"處理: ID={ID}, name={name}")
 
                 token = self.get_token()
                 if not token:
-                    logger.error(f"Skip ID={ID}: cannot get token.")
-                    # 防止無限卡住，稍微等一下
+                    logger.error(f"跳過 ID={ID}: 無法取得 token")
                     time.sleep(1.0)
                     continue
 
@@ -246,9 +289,9 @@ class JudicialSync:
                 today_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                 docs: List[Dict[str, Any]] = []
+
                 if not payload or "data" not in payload or "dataList" not in payload["data"]:
-                    # 視為查無資料
-                    logger.info(f"No dataList for ID={ID}. Insert empty-note record.")
+                    logger.info(f"ID={ID} 查無資料")
                     if rowid:
                         delete_row(self.cursor, db["totb"], ID, rowid)
                     docs.append(self.build_doc_tuple(
@@ -258,7 +301,7 @@ class JudicialSync:
                 else:
                     data_list = payload["data"]["dataList"] or []
                     if len(data_list) == 0:
-                        logger.info(f"Empty dataList for ID={ID}. Insert N record.")
+                        logger.info(f"ID={ID} dataList 為空")
                         if rowid:
                             delete_row(self.cursor, db["totb"], ID, rowid)
                         docs.append(self.build_doc_tuple(
@@ -266,7 +309,6 @@ class JudicialSync:
                             "", "", "", "", "", "", today_str, "N", ""
                         ))
                     else:
-                        # 有資料，逐筆寫入（若目標表已有舊 rowid，先刪除）
                         if rowid:
                             delete_row(self.cursor, db["totb"], ID, rowid)
 
@@ -283,7 +325,6 @@ class JudicialSync:
                             crm_text = str(rec.get("crm_text") or "")
                             owner = str(rec.get("owner") or "")
 
-                            # 附件資訊
                             attachment_rmk = ""
                             attachment_atfilenm = ""
                             attachmentnm = ""
@@ -296,54 +337,83 @@ class JudicialSync:
                             except Exception:
                                 pass
 
-                            # 事實摘要（過長則留空）
                             basis = self.view_basis(crtid, filenm, ID)
                             if len(basis) > 4000:
                                 basis = ""
 
-                            filename = ""  # 如需下載 PDF 可在此實作
                             docs.append(self.build_doc_tuple(
                                 ID, name, crtid, sys_, crmyy, crmid, crmno, crtname, durdt, durnm,
                                 filenm, crm_text, owner, attachment_rmk, attachment_atfilenm,
-                                attachmentnm, basis, today_str, "Y", filename
+                                attachmentnm, basis, today_str, "Y", ""
                             ))
 
                 try:
                     if docs:
+                        logger.ctx.set_operation("DB_insert")
+                        logger.ctx.set_db(server=db['server'], database=db['database'], table=db['totb'], operation="INSERT")
+
                         toSQL(self.cursor, db['totb'], docs)
                         self.conn.commit()
-                        logger.info(f"ID={ID} inserted {len(docs)} row(s). Total today={exit_obs(self.cursor, db['totb'])}")
+
+                        logger.log_db_operation("INSERT", db['database'], db['totb'], len(docs))
+                        logger.increment('records_success', len(docs))
+                        total_processed += len(docs)
+
                 except Exception as e:
-                    logger.error(f"DB write failed for ID={ID}: {e}")
+                    logger.log_db_error(e, "INSERT")
                     try:
                         self.conn.rollback()
                     except Exception:
                         pass
-                    # 攜帶 rowid 的情況可能已刪除舊資料但未成功寫新資料，可標註並繼續
                     continue
 
-                # 輕微節流
                 time.sleep(self.delay)
 
-            logger.info("Sync finished.")
+            logger.log_stats({
+                'total_tasks': tasks,
+                'total_processed': total_processed,
+            })
+
+            logger.task_end(success=True)
+            return True
+
+        except Exception as e:
+            logger.log_exception(e, "執行過程發生錯誤")
+            logger.task_end(success=False)
+            return False
+
         finally:
             try:
                 if self.cursor:
                     self.cursor.close()
                 if self.conn:
                     self.conn.close()
+                logger.info("資料庫連接已關閉")
             except Exception:
                 pass
 
 
-def main():
-    print("司法院消債事件公告同步程式")
-    print("=" * 50)
-    print(f"資料庫: {db['server']}.{db['database']}")
-    print(f"目標資料表: {db['totb']}")
-
+def run():
+    """Main execution function"""
     job = JudicialSync()
-    job.run()
+    return job.run()
+
+
+def main():
+    """Main entry point"""
+    logger.info(f"資料庫: {db['server']}.{db['database']}")
+    logger.info(f"目標資料表: {db['totb']}")
+
+    try:
+        success = run()
+        if success:
+            logger.info("同步完成")
+        else:
+            logger.warning("同步失敗")
+    except KeyboardInterrupt:
+        logger.warning("使用者中斷操作")
+    except Exception as e:
+        logger.log_exception(e, "程式執行錯誤")
 
 
 if __name__ == "__main__":

@@ -14,31 +14,26 @@ import json
 import os
 import sys
 import time
-import logging
 import argparse
 import pdfplumber
 from typing import List, Dict, Optional
+
+# Add parent directory to path for common module
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import db, wbinfo, crawler, crawl_types, paths
 from etl_func import (
     src_obs, get_existing_pdfs, generate_id, parse_tw_date,
     normalize_text, auction_item, auction_info_item, toSQL, exit_obs
 )
+from common.logger import get_logger
 
 # Disable SSL warnings
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('court_auction.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+# Initialize logger
+logger = get_logger('Data-Court_Auction')
 
 
 class PDFReader:
@@ -47,10 +42,13 @@ class PDFReader:
     def __init__(self, file_path: str):
         self.file_path = file_path
         self.file = None
+        logger.ctx.set_operation("PDF_open")
+        logger.ctx.set_data(file_path=file_path)
         try:
             self.file = pdfplumber.open(file_path)
+            logger.debug(f"PDF 開啟成功: {file_path}")
         except Exception as e:
-            logger.error(f"Failed to open PDF: {e}")
+            logger.log_exception(e, f"PDF 開啟失敗: {file_path}")
             raise
 
     def __enter__(self):
@@ -127,6 +125,7 @@ class PDFReader:
 
         owners = []
         parcels = []
+        logger.ctx.set_operation("PDF_extract")
 
         try:
             for page in self.file.pages:
@@ -156,10 +155,11 @@ class PDFReader:
                         'area': normalize_text(parcel.get('area', '')),
                     })
 
+            logger.debug(f"PDF 解析完成: owners={len(owners)}, parcels={len(parcels)}")
             return output
 
         except Exception as e:
-            logger.error(f"PDF extraction failed: {e}")
+            logger.log_exception(e, "PDF 內容解析失敗")
             return []
 
 
@@ -178,6 +178,9 @@ def get_date_range(start_date: str):
 def get_page_data(session, page_num: int, sale_type: str, prop_type: str,
                   start_date: str, end_date: str) -> Optional[Dict]:
     """Get page data from API"""
+    logger.ctx.set_operation("API_fetch_page")
+    logger.ctx.set_data(page=page_num, sale_type=sale_type, prop_type=prop_type)
+
     form_data = {
         'crtnm': '全部',
         'proptype': prop_type,
@@ -190,17 +193,41 @@ def get_page_data(session, page_num: int, sale_type: str, prop_type: str,
         'pageSize': '100',
     }
 
+    start_time = time.time()
     try:
+        logger.log_request("POST", wbinfo['url'], session.headers, form_data)
+
         response = session.post(
             wbinfo['url'],
             data=form_data,
             timeout=crawler['timeout'],
             verify=False
         )
+        elapsed = time.time() - start_time
+
+        logger.log_response(
+            response.status_code,
+            dict(response.headers),
+            response.text[:500] if len(response.text) > 500 else response.text,
+            elapsed
+        )
+
         response.raise_for_status()
         return json.loads(response.text)
+
+    except requests.exceptions.Timeout as e:
+        logger.log_http_error(e, wbinfo['url'])
+        logger.error(f"請求超時: page={page_num}, timeout={crawler['timeout']}s")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.log_http_error(e, wbinfo['url'])
+        return None
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON 解析失敗: {e}")
+        logger.error(f"回應內容: {response.text[:500]}")
+        return None
     except Exception as e:
-        logger.error(f"Failed to get page {page_num}: {e}")
+        logger.log_exception(e, f"取得頁面資料失敗: page={page_num}")
         return None
 
 
@@ -266,14 +293,23 @@ def process_page_data(session, data_list: List[Dict], sale_type: str, prop_type:
     auction_info_tb = db['auction_info_tb']
 
     processed_count = 0
+    total_items = len(data_list)
 
-    for item in data_list:
+    for idx, item in enumerate(data_list, 1):
+        logger.ctx.set_progress(idx, total_items)
+        logger.ctx.set_operation("process_auction_item")
+
         try:
             auction_info = build_auction_info(item, sale_type, prop_type)
             pdf_filename = generate_pdf_filename(auction_info, item)
+            logger.ctx.set_data(
+                court=auction_info['court'],
+                number=auction_info['number'],
+                pdf=pdf_filename
+            )
 
             if pdf_filename in existing_pdfs:
-                logger.debug(f"PDF exists, skip: {pdf_filename}")
+                logger.debug(f"PDF 已存在，跳過: {pdf_filename}")
                 continue
 
             # Generate rowid
@@ -285,24 +321,39 @@ def process_page_data(session, data_list: List[Dict], sale_type: str, prop_type:
             auction_info['entrydate'] = datetime.datetime.now()
 
             # Save auction info
+            logger.ctx.set_operation("DB_insert_auction")
+            logger.ctx.set_db(server=server, database=database, table=totb, operation="INSERT")
+
             docs = auction_item(auction_info)
             toSQL(docs, totb, server, database, username, password)
-            logger.info(f"Saved auction: {auction_info['court']} {auction_info['number']}")
+            logger.log_db_operation("INSERT", database, totb, 1)
+            logger.info(f"儲存拍賣資訊: {auction_info['court']} {auction_info['number']}")
 
             # Download and parse PDF
             pdf_url = auction_info['document']
+            logger.ctx.set_operation("PDF_download")
+
             try:
+                start_time = time.time()
+                logger.log_request("GET", pdf_url, session.headers, None)
+
                 response = session.get(pdf_url, timeout=crawler['pdf_timeout'], verify=False)
+                elapsed = time.time() - start_time
+
+                logger.log_response(response.status_code, dict(response.headers), f"[PDF Binary: {len(response.content)} bytes]", elapsed)
                 response.raise_for_status()
 
                 pdf_path = os.path.join(output_dir, pdf_filename)
                 with open(pdf_path, 'wb') as f:
                     f.write(response.content)
+                logger.debug(f"PDF 下載完成: {pdf_filename}, size={len(response.content)}")
 
                 # Parse PDF
+                logger.ctx.set_operation("PDF_parse")
                 with PDFReader(pdf_path) as reader:
                     pdf_data = reader.extract()
 
+                pdf_items_count = 0
                 for pdf_item in pdf_data:
                     info_data = {
                         **pdf_item,
@@ -319,35 +370,49 @@ def process_page_data(session, data_list: List[Dict], sale_type: str, prop_type:
 
                     info_docs = auction_info_item(info_data)
                     toSQL(info_docs, auction_info_tb, server, database, username, password)
+                    pdf_items_count += 1
 
-                logger.info(f"Processed PDF: {pdf_filename}")
+                logger.log_db_operation("INSERT", database, auction_info_tb, pdf_items_count)
+                logger.info(f"PDF 處理完成: {pdf_filename}, items={pdf_items_count}")
 
+            except requests.exceptions.Timeout as e:
+                logger.log_http_error(e, pdf_url)
+                logger.warning(f"PDF 下載超時: {pdf_url}")
+            except requests.exceptions.RequestException as e:
+                logger.log_http_error(e, pdf_url)
             except Exception as e:
-                logger.error(f"Failed to process PDF ({pdf_url}): {e}")
+                logger.log_exception(e, f"PDF 處理失敗: {pdf_url}")
 
             processed_count += 1
+            logger.increment('records_success')
 
             # Check daily limit
             exit_count = exit_obs(server, username, password, database, totb)
             if exit_count >= 10000:
-                logger.info("Daily limit reached, stopping")
+                logger.warning(f"每日處理上限達成: {exit_count} >= 10000")
+                logger.task_end(success=True)
                 sys.exit(0)
 
         except Exception as e:
-            logger.error(f"Failed to process item: {e}")
+            logger.log_exception(e, f"處理拍賣項目失敗: item_index={idx}")
+            logger.increment('records_failed')
             continue
 
     return processed_count
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Court Auction Crawler')
-    parser.add_argument('--start_date', type=str, help='Start date (YYYYMMDD)')
-    args = parser.parse_args()
+def run(start_date: str = None):
+    """Main execution function"""
+    if start_date is None:
+        start_date = datetime.datetime.now().strftime('%Y%m%d')
 
-    start_date = args.start_date or datetime.datetime.now().strftime('%Y%m%d')
+    # Start task logging
+    logger.task_start("法拍屋資料爬取")
 
-    logger.info(f"Starting crawler, date: {start_date}")
+    logger.info(f"查詢起始日期: {start_date}")
+
+    # Log database config
+    logger.log_db_connect(db['server'], db['database'], db['username'])
 
     # Setup session
     session = requests.Session()
@@ -359,6 +424,7 @@ def main():
     # Create output directory
     output_dir = paths['output_dir']
     os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"輸出目錄: {output_dir}")
 
     # Get existing PDFs
     server = db['server']
@@ -367,36 +433,43 @@ def main():
     password = db['password']
     totb = db['totb']
 
+    logger.ctx.set_operation("DB_query_existing")
     obs = src_obs(server, username, password, database, totb, totb)
-    logger.info(f"Existing records: {obs}")
+    logger.info(f"現有記錄數: {obs}")
 
     existing_pdfs = get_existing_pdfs(server, username, password, database, totb)
-    logger.info(f"Existing PDFs: {len(existing_pdfs)}")
+    logger.info(f"現有 PDF 數: {len(existing_pdfs)}")
 
     # Get date range
     start_date_str, end_date_str = get_date_range(start_date)
-    logger.info(f"Date range: {start_date_str} - {end_date_str}")
+    logger.info(f"查詢日期範圍: {start_date_str} - {end_date_str}")
 
     total_processed = 0
+    success = True
 
     try:
         for sale_type in crawl_types['sale_types']:
             for prop_type in crawl_types['prop_types']:
-                logger.info(f"Processing sale_type: {sale_type}, prop_type: {prop_type}")
+                logger.info(f"處理類型: sale_type={sale_type}, prop_type={prop_type}")
+                logger.ctx.set_data(sale_type=sale_type, prop_type=prop_type)
 
                 # Get first page
                 first_page = get_page_data(session, 1, sale_type, prop_type, start_date_str, end_date_str)
                 if not first_page:
+                    logger.warning(f"無法取得第一頁資料: sale_type={sale_type}, prop_type={prop_type}")
                     continue
 
                 total_num = first_page.get('pageInfo', {}).get('totalNum', 0)
                 max_page = (total_num // 100) + 1
-                logger.info(f"Total: {total_num} records, {max_page} pages")
+                logger.info(f"總記錄數: {total_num}, 總頁數: {max_page}")
 
                 # Process all pages
                 for page in range(1, max_page + 1):
+                    logger.log_progress(page, max_page, f"page_{page}")
+
                     page_data = get_page_data(session, page, sale_type, prop_type, start_date_str, end_date_str)
                     if not page_data:
+                        logger.warning(f"無法取得頁面資料: page={page}")
                         continue
 
                     processed = process_page_data(
@@ -412,11 +485,29 @@ def main():
                     time.sleep(crawler['delay'])
 
     except KeyboardInterrupt:
-        logger.info("User interrupted")
+        logger.warning("使用者中斷執行")
+        success = False
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.log_exception(e, "爬蟲執行過程發生錯誤")
+        success = False
 
-    logger.info(f"Completed, total processed: {total_processed}")
+    # Log final statistics
+    logger.log_stats({
+        'total_processed': total_processed,
+        'sale_types': len(crawl_types['sale_types']),
+        'prop_types': len(crawl_types['prop_types']),
+    })
+
+    logger.task_end(success=success)
+    return success
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Court Auction Crawler')
+    parser.add_argument('--start_date', type=str, help='Start date (YYYYMMDD)')
+    args = parser.parse_args()
+
+    run(start_date=args.start_date)
 
 
 if __name__ == '__main__':

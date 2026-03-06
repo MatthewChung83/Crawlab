@@ -1,26 +1,37 @@
+# -*- coding: utf-8 -*-
 """
-Legal Insurance Automation - Final Version
+Legal Insurance Automation - 保險公會費用查詢
 使用已驗證的 crr901w/verify 和 crr201w/payment API + 資料庫整合
 """
+import os
+import sys
 import requests
 import urllib3
-
-# 抑制 SSL 警告 (因為 insurtech.lia-roc.org.tw 憑證有問題)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import imaplib
 import email
 import re
 import time
 import datetime
 import json
-import os
 import base64
 import socket
 import io
+
 from smb.SMBConnection import SMBConnection
 from playwright.sync_api import sync_playwright
+
+# Add parent directory to path for common module
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from config import db, vars
 from etl_func import src_obs, dbfrom, update, foo
+from common.logger import get_logger
+
+# 抑制 SSL 警告 (因為 insurtech.lia-roc.org.tw 憑證有問題)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Initialize logger
+logger = get_logger('Data-Legal_Insur')
 
 # SMB 配置
 SMB_CONFIG = {
@@ -116,10 +127,17 @@ def send_otp_email(email_addr):
 
     while retry_count < max_retries:
         try:
+            logger.ctx.set_operation("send_otp")
+            start_time = time.time()
+            logger.log_request("POST", url, headers, f"email={email_addr[:5]}***")
+
             response = requests.post(url, data=email_addr, headers=headers, verify=False)
+            elapsed = time.time() - start_time
+
+            logger.log_response(response.status_code, dict(response.headers), response.text[:200], elapsed)
 
             if response.status_code == 200:
-                print("✅ OTP 發送成功")
+                logger.info("OTP 發送成功")
                 return True
 
             if response.status_code == 400:
@@ -128,22 +146,20 @@ def send_otp_email(email_addr):
                     if "驗證碼時效未到" in error_data.get("title", ""):
                         retry_count += 1
                         if retry_count < max_retries:
-                            print(f"⚠️ 驗證碼時效未到，等待 60 秒... (第 {retry_count}/{max_retries} 次)")
-                            for i in range(60, 0, -10):
-                                print(f"   還剩 {i} 秒...")
-                                time.sleep(10)
+                            logger.warning(f"驗證碼時效未到，等待 60 秒 (第 {retry_count}/{max_retries} 次)")
+                            time.sleep(60)
                             continue
                         else:
-                            print(f"❌ 已達最大重試次數，放棄發送")
+                            logger.error("已達最大重試次數，放棄發送")
                             return False
                 except:
                     pass
 
-            print(f"❌ OTP 發送失敗，狀態碼: {response.status_code}")
+            logger.error(f"OTP 發送失敗，狀態碼: {response.status_code}")
             return False
 
         except Exception as e:
-            print(f"❌ 發送 OTP 錯誤: {e}")
+            logger.log_exception(e, "發送 OTP 錯誤")
             return False
 
     return False
@@ -153,6 +169,8 @@ def get_verification_code_from_email(email_addr, email_password, max_retries=10)
     """從Gmail抓取驗證碼"""
     verification_code = ''
     retry_count = 0
+
+    logger.ctx.set_operation("get_email_code")
 
     while len(verification_code) == 0 and retry_count < max_retries:
         try:
@@ -179,7 +197,7 @@ def get_verification_code_from_email(email_addr, email_password, max_retries=10)
                                     match = re.search(r'驗證碼為[^\d]*(\d{6})', message)
                                     if match:
                                         verification_code = match.group(1)
-                                        print(f'✅ 找到驗證碼: {verification_code}')
+                                        logger.info(f"找到驗證碼: {verification_code}")
                                         break
                                 except:
                                     continue
@@ -189,7 +207,7 @@ def get_verification_code_from_email(email_addr, email_password, max_retries=10)
                             match = re.search(r'驗證碼為[^\d]*(\d{6})', message)
                             if match:
                                 verification_code = match.group(1)
-                                print(f'✅ 找到驗證碼: {verification_code}')
+                                logger.info(f"找到驗證碼: {verification_code}")
                         except:
                             pass
 
@@ -197,11 +215,11 @@ def get_verification_code_from_email(email_addr, email_password, max_retries=10)
 
             if len(verification_code) == 0:
                 retry_count += 1
-                print(f"驗證碼未找到，重試 {retry_count}/{max_retries}")
+                logger.debug(f"驗證碼未找到，重試 {retry_count}/{max_retries}")
                 time.sleep(3)
 
         except Exception as e:
-            print(f"郵件檢查錯誤: {e}")
+            logger.warning(f"郵件檢查錯誤: {e}")
             retry_count += 1
             time.sleep(3)
 
@@ -214,9 +232,9 @@ def verify_and_submit_case(verify_code, email, name, phone, debtor_ids, legal_nu
 
     try:
         verify_code_int = int(verify_code)
-        print(f"✅ 驗證碼轉換成功: {verify_code_int}")
+        logger.debug(f"驗證碼轉換成功: {verify_code_int}")
     except (ValueError, TypeError):
-        print(f"❌ 驗證碼格式錯誤: {verify_code}")
+        logger.error(f"驗證碼格式錯誤: {verify_code}")
         return None
 
     # 將身分證字串轉為陣列
@@ -242,22 +260,24 @@ def verify_and_submit_case(verify_code, email, name, phone, debtor_ids, legal_nu
         'X-Requested-With': 'XMLHttpRequest'
     }
 
-    print(f"\n發送驗證請求到 crr901w/verify")
-    print(f"  身分證: {query_id_list}")
-    print(f"  案號: {legal_num}")
-    print(f"  公文來源: {legal_court}")
+    logger.ctx.set_operation("verify_case")
+    logger.debug(f"發送驗證請求 - 身分證: {query_id_list}, 案號: {legal_num}")
 
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=30, verify=False)
+        start_time = time.time()
+        logger.log_request("POST", url, headers, f"案號={legal_num}, 債務人數={len(query_id_list)}")
 
-        print(f"回應狀態碼: {response.status_code}")
+        response = requests.post(url, json=payload, headers=headers, timeout=30, verify=False)
+        elapsed = time.time() - start_time
+
+        logger.log_response(response.status_code, dict(response.headers), response.text[:300], elapsed)
 
         # 提取 Token
         token = None
         auth_header = response.headers.get('Authorization', '')
         if auth_header.startswith('Bearer '):
             token = auth_header.replace('Bearer ', '')
-            print(f"✅ 提取到 Token: {token[:20]}...")
+            logger.debug(f"提取到 Token: {token[:20]}...")
 
         # 解析 JSON
         data = json.loads(response.text)
@@ -266,31 +286,30 @@ def verify_and_submit_case(verify_code, email, name, phone, debtor_ids, legal_nu
 
         # 檢查錯誤狀態
         if status_code == "EMAIL_VERIFY_FAIL":
-            print(f"❌ 郵箱驗證失敗 (EMAIL_VERIFY_FAIL)")
+            logger.error("郵箱驗證失敗 (EMAIL_VERIFY_FAIL)")
             return None
 
         if status_code == "INSURANCE_PARTIES_ABNORMALITY":
-            print(f"❌ 保險當事人異常 (INSURANCE_PARTIES_ABNORMALITY)")
+            logger.error("保險當事人異常 (INSURANCE_PARTIES_ABNORMALITY)")
             return {"error": "INSURANCE_PARTIES_ABNORMALITY"}
 
         if status_code == "VERIFY_FAIL":
-            print(f"❌ 驗證失敗 (VERIFY_FAIL)")
+            logger.error("驗證失敗 (VERIFY_FAIL)")
             return {"error": "VERIFY_FAIL"}
 
         if status_code == "ISSUE_NO_INVALID":
-            print(f"❌ 案號無效 (ISSUE_NO_INVALID)")
+            logger.error("案號無效 (ISSUE_NO_INVALID)")
             return {"error": "ISSUE_NO_INVALID"}
 
         if response.status_code == 200 and case_uid:
-            print(f"✅ 驗證成功，取得 caseUid: {case_uid}")
+            logger.info(f"驗證成功，取得 caseUid: {case_uid}")
             return {"token": token, "caseUid": case_uid}
         else:
-            print(f"❌ 驗證失敗")
-            print(f"回應: {response.text}")
+            logger.error(f"驗證失敗: {response.text[:200]}")
             return None
 
     except Exception as e:
-        print(f"❌ 驗證 API 錯誤: {e}")
+        logger.log_exception(e, "驗證 API 錯誤")
         return None
 
 
@@ -318,13 +337,17 @@ def submit_payment_request(token, case_uuid, name, phone, email, compiled, compa
         'Authorization': f'Bearer {token}'
     }
 
-    print(f"\n提交付款請求到 crr201w/payment")
-    print(f"  caseUuid: {case_uuid}")
+    logger.ctx.set_operation("submit_payment")
+    logger.debug(f"提交付款請求 - caseUuid: {case_uuid}")
 
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=30, verify=False)
+        start_time = time.time()
+        logger.log_request("POST", url, headers, f"caseUuid={case_uuid}")
 
-        print(f"回應狀態碼: {response.status_code}")
+        response = requests.post(url, json=payload, headers=headers, timeout=30, verify=False)
+        elapsed = time.time() - start_time
+
+        logger.log_response(response.status_code, dict(response.headers), response.text[:300], elapsed)
 
         if response.status_code == 200:
             json_response = response.json()
@@ -341,7 +364,7 @@ def submit_payment_request(token, case_uuid, name, phone, email, compiled, compa
                     for name, value in matches:
                         form_fields[name] = value
 
-                print("✅ 付款請求成功")
+                logger.info("付款請求成功")
                 return {
                     "code": json_response.get("code"),
                     "msg": json_response.get("msg"),
@@ -354,37 +377,39 @@ def submit_payment_request(token, case_uuid, name, phone, email, compiled, compa
                 }
             else:
                 msg = json_response.get("msg", "")
-                print(f"⚠️ {msg}")
+                logger.warning(f"付款請求回應: {msg}")
                 # 檢查是否為債務人數量比對失敗
                 if "債務人數量比對失敗" in msg or "債務人比對失敗" in msg:
                     return {"msg": msg, "error": "DEBTOR_COUNT_MISMATCH"}
                 return {"msg": msg}
 
-        print(f"❌ 付款請求失敗")
+        logger.error("付款請求失敗")
         return None
 
     except Exception as e:
-        print(f"❌ 付款 API 錯誤: {e}")
+        logger.log_exception(e, "付款 API 錯誤")
         return None
 
 
 def process_ecpay_with_playwright(payment_data, case_id, file_date):
     """使用 Playwright 處理綠界金流 (步驟 5、6、7 合併)"""
     if not payment_data or not payment_data.get('formFields'):
-        print("❌ 沒有表單資料")
+        logger.error("沒有表單資料")
         return None
 
     form_fields = payment_data['formFields']
 
     try:
-        print("🌐 啟動 Playwright 瀏覽器...")
+        logger.ctx.set_operation("ecpay_playwright")
+        logger.info("啟動 Playwright 瀏覽器...")
+
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context()
             page = context.new_page()
 
             # 步驟 5: 建立 HTML 表單並提交到綠界 V5
-            print("📝 建立表單並提交到綠界...")
+            logger.debug("建立表單並提交到綠界...")
             form_html = '<html><body><form id="ecpay_form" method="post" action="https://payment.ecpay.com.tw/Cashier/AioCheckOut/V5">'
             for key, value in form_fields.items():
                 escaped_value = str(value).replace('"', '&quot;')
@@ -397,108 +422,93 @@ def process_ecpay_with_playwright(payment_data, case_id, file_date):
 
             # 確認是否成功進入付款頁面
             if '選擇支付方式' in page.title() or '綠界科技' in page.title():
-                print("✅ 成功進入綠界付款頁面")
+                logger.debug("成功進入綠界付款頁面")
             else:
-                print(f"⚠️ 頁面標題: {page.title()}")
+                logger.debug(f"頁面標題: {page.title()}")
 
             # 步驟 6: 選擇 ATM 付款方式
-            print("🏧 選擇 ATM 付款方式...")
+            logger.debug("選擇 ATM 付款方式...")
 
             # 等待 ATM 選項出現並點擊
             try:
                 atm_tab = page.locator('#liATM')
                 atm_tab.wait_for(state='visible', timeout=10000)
                 atm_tab.click()
-                print("✅ 已點擊 ATM 選項")
+                logger.debug("已點擊 ATM 選項")
                 time.sleep(2)  # 等待 UI 更新
             except Exception as e:
-                print(f"⚠️ 點擊 ATM 選項失敗: {e}")
+                logger.warning(f"點擊 ATM 選項失敗: {e}")
 
-            # 選擇銀行 - 使用下拉選單的 value 值
-            # 銀行 PaymentID 對應:
-            # 10002@8@ATM_CHINATRUST = 中國信託 (822)
-            # 10002@5@ATM_BOT = 台灣銀行 (004)
-            # 10002@11@ATM_LAND = 台灣土地銀行 (005)
-            # 10002@7@ATM_FIRST = 第一銀行 (007)
-            # 10002@9@ATM_CATHAY = 國泰世華銀行 (013)
-            # 10002@17@ATM_PANHSIN = 板信銀行 (118)
-            BANK_PAYMENT_ID = '10002@8@ATM_CHINATRUST'  # 可在此修改銀行
+            # 選擇銀行
+            BANK_PAYMENT_ID = '10002@8@ATM_CHINATRUST'
 
             try:
-                # 等待頁面穩定
                 time.sleep(1)
-
-                # 使用 select_option 選擇銀行 (下拉選單)
                 select_element = page.locator('select').first
                 select_element.select_option(value=BANK_PAYMENT_ID)
-                print(f"✅ 已從下拉選單選擇銀行: 中國信託 (822)")
+                logger.debug("已從下拉選單選擇銀行: 中國信託 (822)")
                 time.sleep(1)
-
             except Exception as e:
-                print(f"⚠️ 選擇銀行時發生問題: {e}")
+                logger.warning(f"選擇銀行時發生問題: {e}")
 
             # 點擊取得繳費帳號按鈕
             try:
                 submit_btn = page.locator('text=取得繳費帳號')
                 if submit_btn.count() > 0:
                     submit_btn.first.click()
-                    print("✅ 已點擊取得繳費帳號")
+                    logger.debug("已點擊取得繳費帳號")
                 else:
-                    # 嘗試其他可能的按鈕
                     submit_btn = page.locator('.btn:has-text("取得")')
                     if submit_btn.count() > 0:
                         submit_btn.first.click()
-                        print("✅ 已點擊確認按鈕")
+                        logger.debug("已點擊確認按鈕")
             except Exception as e:
-                print(f"⚠️ 點擊提交按鈕失敗: {e}")
+                logger.warning(f"點擊提交按鈕失敗: {e}")
 
             # 步驟 7: 等待 ATM 資訊頁面
-            print("⏳ 等待 ATM 付款資訊頁面...")
+            logger.debug("等待 ATM 付款資訊頁面...")
             try:
                 page.wait_for_load_state('networkidle', timeout=30000)
-                time.sleep(2)  # 額外等待
+                time.sleep(2)
 
-                # 取得頁面內容
                 html_content = page.content()
 
-                # 檢查是否有 ATM 資訊
                 if '銀行代碼' in html_content or '虛擬帳號' in html_content or 'ATM繳費帳號' in html_content:
-                    print("✅ 成功取得 ATM 付款資訊")
+                    logger.info("成功取得 ATM 付款資訊")
 
-                    # 提取 ATM 資訊 (根據綠界 ATM 結果頁面結構)
                     atm_info = {}
 
-                    # 訂單編號 - 在 <dt>訂單編號</dt><dd> 後面
+                    # 訂單編號
                     order_match = re.search(r'<dt>訂單編號</dt>\s*<dd>\s*([A-Za-z0-9]+)', html_content)
                     if order_match:
                         atm_info['MerchantTradeNo'] = order_match.group(1).strip()
 
-                    # 銀行代碼 - 格式: 銀行代碼 822
+                    # 銀行代碼
                     bank_code_match = re.search(r'銀行代碼\s*(\d{3})', html_content)
                     if bank_code_match:
                         atm_info['BankCode'] = bank_code_match.group(1)
 
-                    # 虛擬帳號 - 在 <span class="oif-hl"> 內，格式: 9251 2603 8942 8709
+                    # 虛擬帳號
                     account_match = re.search(r'<span class="oif-hl">([0-9\s]+)</span>', html_content)
                     if account_match:
                         atm_info['vAccount'] = account_match.group(1).replace(' ', '').strip()
 
-                    # 應付金額 - 格式: NT$ 350
+                    # 應付金額
                     amount_match = re.search(r'<dd class="o-other-total">NT\$\s*(\d+)</dd>', html_content)
                     if amount_match:
                         atm_info['TradeAmount'] = amount_match.group(1)
 
-                    # 繳費截止時間 - 在 <dt>繳費截止時間</dt><dd> 後面
+                    # 繳費截止時間
                     expire_match = re.search(r'<dt>繳費截止時間</dt>\s*<dd[^>]*>([^<]+)</dd>', html_content)
                     if expire_match:
                         atm_info['ExpireDate'] = expire_match.group(1).strip()
 
-                    # 商品名稱 - 在商品清單區塊的 <dd class="o-pd-name"> 內 (跳過標題的「商品明細」)
+                    # 商品名稱
                     item_match = re.search(r'<!-- 商品清單 start -->.*?<dd class="o-pd-name">\s*\n?([^<]+?)(?:<br|</dd>)', html_content, re.DOTALL)
                     if item_match:
                         atm_info['ItemName'] = item_match.group(1).strip()
 
-                    print(f"📋 提取到的 ATM 資訊: {atm_info}")
+                    logger.debug(f"提取到的 ATM 資訊: {atm_info}")
 
                     # 儲存 HTML
                     temp_dir = f'./temp_{file_date}'
@@ -507,12 +517,11 @@ def process_ecpay_with_playwright(payment_data, case_id, file_date):
                     html_filename = f'{case_id}.html'
                     html_filepath = os.path.join(temp_dir, html_filename)
 
-                    # 使用原始頁面建立可列印 HTML
                     printable_html = create_printable_html_from_response(html_content)
 
                     with open(html_filepath, 'w', encoding='utf-8') as f:
                         f.write(printable_html)
-                    print(f"✅ 儲存暫存HTML: {html_filepath}")
+                    logger.debug(f"儲存暫存HTML: {html_filepath}")
 
                     # 使用 Playwright 直接生成 PDF
                     pdf_filename = f'{case_id}.pdf'
@@ -525,10 +534,10 @@ def process_ecpay_with_playwright(payment_data, case_id, file_date):
                             print_background=True,
                             margin={'top': '0.5cm', 'right': '0.5cm', 'bottom': '0.5cm', 'left': '0.5cm'}
                         )
-                        print(f"✅ 儲存暫存PDF: {pdf_filepath}")
+                        logger.debug(f"儲存暫存PDF: {pdf_filepath}")
                         pdf_created = True
                     except Exception as e:
-                        print(f"⚠️ PDF 生成失敗: {e}")
+                        logger.warning(f"PDF 生成失敗: {e}")
                         pdf_created = False
 
                     browser.close()
@@ -556,24 +565,22 @@ def process_ecpay_with_playwright(payment_data, case_id, file_date):
                             os.remove(pdf_filepath)
                         if os.path.exists(temp_dir) and not os.listdir(temp_dir):
                             os.rmdir(temp_dir)
-                        print("✅ 已清理暫存檔案")
+                        logger.debug("已清理暫存檔案")
                     except Exception as e:
-                        print(f"⚠️ 清理暫存檔案失敗: {e}")
+                        logger.warning(f"清理暫存檔案失敗: {e}")
 
                     return atm_info
 
                 else:
-                    print(f"❌ 未找到 ATM 資訊")
+                    logger.error("未找到 ATM 資訊")
 
             except Exception as e:
-                print(f"❌ 等待 ATM 頁面失敗: {e}")
+                logger.log_exception(e, "等待 ATM 頁面失敗")
 
             browser.close()
 
     except Exception as e:
-        print(f"❌ Playwright 處理錯誤: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.log_exception(e, "Playwright 處理錯誤")
 
     return None
 
@@ -612,11 +619,8 @@ def create_printable_html_from_response(html_content):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     font_path = os.path.join(script_dir, 'NotoSansTC-Regular.ttf')
 
-    # 方法1: 嵌入 base64 字體（最可靠，但會增加 HTML 檔案大小）
-    # 方法2: 使用 file:// URL（檔案小，但需要保持字體檔案路徑）
     if os.path.exists(font_path):
         try:
-            # 讀取字體檔案並轉換為 base64
             with open(font_path, 'rb') as font_file:
                 font_data = base64.b64encode(font_file.read()).decode('utf-8')
 
@@ -628,13 +632,10 @@ def create_printable_html_from_response(html_content):
             font-style: normal;
         }}"""
             font_family = '"Noto Sans TC", "Microsoft JhengHei", Arial, sans-serif'
-            print(f"✅ 已嵌入字體檔案: {font_path}")
         except Exception as e:
-            print(f"⚠️ 字體檔案讀取失敗: {e}，使用系統預設字體")
             font_face = ""
             font_family = '"Microsoft JhengHei", Arial, sans-serif'
     else:
-        print(f"⚠️ 字體檔案未找到: {font_path}，使用系統預設字體")
         font_face = ""
         font_family = '"Microsoft JhengHei", Arial, sans-serif'
 
@@ -753,8 +754,7 @@ def upload_to_smb(local_file_path, remote_file_name, file_date):
         connected = conn.connect(SMB_CONFIG['server_ip'], 445)
 
         if not connected:
-            # 如果 445 失敗，嘗試 139 端口 (NetBIOS)
-            print(f"⚠️ 445 端口連線失敗，嘗試 139 端口...")
+            logger.warning("445 端口連線失敗，嘗試 139 端口...")
             conn = SMBConnection(
                 SMB_CONFIG['username'],
                 SMB_CONFIG['password'],
@@ -767,21 +767,19 @@ def upload_to_smb(local_file_path, remote_file_name, file_date):
             connected = conn.connect(SMB_CONFIG['server_ip'], 139)
 
         if not connected:
-            print(f"❌ 無法連線到 SMB 伺服器: {SMB_CONFIG['server_ip']}")
+            logger.error(f"無法連線到 SMB 伺服器: {SMB_CONFIG['server_ip']}")
             return None
 
-        # 建構遠端路徑: AM/LEGAL/@@@@@保險公會費用及發票/image/yyyymmdd/
+        # 建構遠端路徑
         remote_dir = f"{SMB_CONFIG['base_path']}{file_date}/"
 
-        # 嘗試建立目錄（如果不存在）
         try:
             conn.createDirectory(SMB_CONFIG['service_name'], remote_dir)
-            print(f"✅ 建立 SMB 目錄: {remote_dir}")
+            logger.debug(f"建立 SMB 目錄: {remote_dir}")
         except:
-            # 目錄可能已存在，忽略錯誤
             pass
 
-        # 上傳檔案 - 使用 BytesIO
+        # 上傳檔案
         remote_path = f"{remote_dir}{remote_file_name}"
         with open(local_file_path, 'rb') as f:
             file_data = f.read()
@@ -791,23 +789,21 @@ def upload_to_smb(local_file_path, remote_file_name, file_date):
 
         conn.close()
 
-        print(f"✅ 檔案已上傳到 SMB: {remote_path} ({bytes_uploaded} bytes)")
+        logger.debug(f"檔案已上傳到 SMB: {remote_path} ({bytes_uploaded} bytes)")
         return f"\\\\{SMB_CONFIG['server_ip']}\\{SMB_CONFIG['service_name']}\\{remote_path.replace('/', chr(92))}"
 
     except Exception as e:
-        print(f"❌ SMB 上傳失敗: {e}")
+        logger.warning(f"SMB 上傳失敗: {e}")
         return None
 
 
 def get_atm_info_and_save(retain_result, case_id, file_date):
     """取得ATM付款資訊並儲存"""
     if not retain_result or not retain_result.get('atm_form_fields'):
-        print("❌ 沒有ATM表單資料")
+        logger.error("沒有ATM表單資料")
         return None
 
-    # 使用傳入的 session 保持 cookie
     session = retain_result.get('session', requests.Session())
-
     url = "https://payment.ecpay.com.tw/PaymentRule/ATMPaymentInfo"
     form_fields = retain_result['atm_form_fields']
 
@@ -823,7 +819,7 @@ def get_atm_info_and_save(retain_result, case_id, file_date):
         response = session.post(url, data=post_data, headers=headers, timeout=30)
 
         if response.status_code == 200:
-            print("✅ 取得ATM付款資訊成功")
+            logger.info("取得ATM付款資訊成功")
 
             atm_info = {
                 'AllPayTradeNo': form_fields.get('AllPayTradeNo'),
@@ -835,7 +831,6 @@ def get_atm_info_and_save(retain_result, case_id, file_date):
                 'ItemName': form_fields.get('ItemName')
             }
 
-            # 儲存HTML和PDF (先存本地暫存目錄)
             temp_dir = f'./temp_{file_date}'
             os.makedirs(temp_dir, exist_ok=True)
 
@@ -847,68 +842,53 @@ def get_atm_info_and_save(retain_result, case_id, file_date):
 
             printable_html = create_printable_html_from_response(response.text)
 
-            # 儲存HTML (暫存)
             with open(html_filepath, 'w', encoding='utf-8') as f:
                 f.write(printable_html)
-            print(f"✅ 儲存暫存HTML: {html_filepath}")
+            logger.debug(f"儲存暫存HTML: {html_filepath}")
 
-            # 轉換為PDF (使用 Playwright)
             pdf_created = False
             try:
-                print("📄 使用 Playwright 生成 PDF...")
+                logger.debug("使用 Playwright 生成 PDF...")
                 with sync_playwright() as p:
-                    # 啟動 Chromium 瀏覽器
                     browser = p.chromium.launch(headless=True)
                     page = browser.new_page()
 
-                    # 將絕對路徑轉換為 file:// URL
                     file_url = f"file:///{os.path.abspath(html_filepath).replace(chr(92), '/')}"
-
-                    # 載入 HTML
                     page.goto(file_url)
                     page.wait_for_load_state('networkidle')
 
-                    # 生成 PDF
                     page.pdf(
                         path=pdf_filepath,
                         format='A4',
                         print_background=True,
-                        margin={
-                            'top': '0.5cm',
-                            'right': '0.5cm',
-                            'bottom': '0.5cm',
-                            'left': '0.5cm'
-                        }
+                        margin={'top': '0.5cm', 'right': '0.5cm', 'bottom': '0.5cm', 'left': '0.5cm'}
                     )
 
                     browser.close()
 
                 if os.path.exists(pdf_filepath):
-                    print(f"✅ 儲存暫存PDF: {pdf_filepath}")
+                    logger.debug(f"儲存暫存PDF: {pdf_filepath}")
                     pdf_created = True
                 else:
-                    print("⚠️ PDF轉換失敗：檔案未產生")
+                    logger.warning("PDF轉換失敗：檔案未產生")
 
             except Exception as e:
-                print(f"⚠️ PDF轉換失敗: {e}")
+                logger.warning(f"PDF轉換失敗: {e}")
 
-            # 上傳 PDF 到 SMB
             smb_pdf_path = None
             if pdf_created:
                 smb_pdf_path = upload_to_smb(pdf_filepath, pdf_filename, file_date)
                 if smb_pdf_path:
                     atm_info['saved_pdf'] = smb_pdf_path
                 else:
-                    atm_info['saved_pdf'] = pdf_filepath  # 回退到本地路徑
+                    atm_info['saved_pdf'] = pdf_filepath
 
-            # 上傳 HTML 到 SMB (可選)
             smb_html_path = upload_to_smb(html_filepath, html_filename, file_date)
             if smb_html_path:
                 atm_info['saved_html'] = smb_html_path
             else:
-                atm_info['saved_html'] = html_filepath  # 回退到本地路徑
+                atm_info['saved_html'] = html_filepath
 
-            # 清理暫存檔案 (可選 - 如果你想保留本地備份，註解掉以下程式碼)
             try:
                 if os.path.exists(html_filepath):
                     os.remove(html_filepath)
@@ -916,17 +896,17 @@ def get_atm_info_and_save(retain_result, case_id, file_date):
                     os.remove(pdf_filepath)
                 if os.path.exists(temp_dir) and not os.listdir(temp_dir):
                     os.rmdir(temp_dir)
-                print("✅ 已清理暫存檔案")
+                logger.debug("已清理暫存檔案")
             except Exception as e:
-                print(f"⚠️ 清理暫存檔案失敗: {e}")
+                logger.warning(f"清理暫存檔案失敗: {e}")
 
             return atm_info
 
-        print(f"❌ 取得ATM資訊失敗，狀態碼: {response.status_code}")
+        logger.error(f"取得ATM資訊失敗，狀態碼: {response.status_code}")
         return None
 
     except Exception as e:
-        print(f"❌ 取得ATM資訊錯誤: {e}")
+        logger.log_exception(e, "取得ATM資訊錯誤")
         return None
 
 
@@ -939,12 +919,11 @@ def process_single_case(case_data, today, file_date):
     Insur_Type = str(case_data[17])
     RequestDate = str(case_data[21])
 
-    print(f"\n{'='*80}")
-    print(f"處理案件: {Casei}")
-    print(f"{'='*80}")
+    logger.ctx.set_data(case_id=Casei, legal_num=legal_num)
+    logger.info(f"處理案件: {Casei}")
 
     if RequestDate != today:
-        print(f"⚠️ 請求日期不符，跳過")
+        logger.warning(f"請求日期不符 ({RequestDate} != {today})，跳過")
         return False
 
     # 選擇使用者
@@ -961,39 +940,37 @@ def process_single_case(case_data, today, file_date):
         Name, Mail, PSD = vars['Name005'], vars['Mail005'], vars['PSD005']
         Phone, Compiled, Company, Address = vars['Phone005'], vars['Compiled005'], vars['Company005'], vars['Address005']
     else:
-        print(f"❌ 無效的保險類型: {Insur_Type}")
+        logger.error(f"無效的保險類型: {Insur_Type}")
         return False
 
-    print(f"使用者: {Name} ({Mail})")
-    print(f"公司: {Company}")
+    logger.debug(f"使用者: {Name}, 公司: {Company}")
 
     # 步驟 1: 發送OTP
-    print("\n--- 步驟 1: 發送OTP ---")
+    logger.info("步驟 1: 發送OTP")
     if not send_otp_email(Mail):
         return False
 
     # 步驟 2: 取得驗證碼
-    print("\n--- 步驟 2: 取得驗證碼 ---")
-    print("等待 15 秒...")
+    logger.info("步驟 2: 取得驗證碼")
+    logger.debug("等待 15 秒...")
     time.sleep(15)
     verify_code = get_verification_code_from_email(Mail, PSD)
     if not verify_code:
         return False
 
     # 步驟 3: 驗證並提交案件 (crr901w/verify) - 最多重試 5 次
-    print("\n--- 步驟 3: 驗證並提交案件 ---")
+    logger.info("步驟 3: 驗證並提交案件")
     max_verify_retries = 5
     verify_fail_count = 0
     verify_result = None
 
     for attempt in range(1, max_verify_retries + 1):
         if attempt > 1:
-            print(f"\n重試第 {attempt} 次...")
-            # 重新發送OTP
+            logger.info(f"重試第 {attempt} 次...")
             if not send_otp_email(Mail):
                 verify_fail_count += 1
                 continue
-            print("等待 15 秒...")
+            logger.debug("等待 15 秒...")
             time.sleep(15)
             verify_code = get_verification_code_from_email(Mail, PSD)
             if not verify_code:
@@ -1007,32 +984,31 @@ def process_single_case(case_data, today, file_date):
             verify_fail_count += 1
             continue
 
-        # 檢查是否為保險當事人異常
         if verify_result.get('error') == 'INSURANCE_PARTIES_ABNORMALITY':
-            print(f"⚠️ 保險當事人錯誤")
+            logger.warning("保險當事人錯誤")
             update(db['server'], db['username'], db['password'], db['database'], db['totb'],
                    '保險當事人錯誤', Casei, '', '', '', '', '', '', '', '', '', 'F', today)
+            logger.increment('records_failed')
             return True
 
-        # 檢查是否為案號無效
         if verify_result.get('error') == 'ISSUE_NO_INVALID':
-            print(f"⚠️ 公文或案號無效")
+            logger.warning("公文或案號無效")
             update(db['server'], db['username'], db['password'], db['database'], db['totb'],
                    '公文或案號無效', Casei, '', '', '', '', '', '', '', '', '', 'F', today)
+            logger.increment('records_failed')
             return True
 
-        # 檢查是否為 VERIFY_FAIL
         if verify_result.get('error') == 'VERIFY_FAIL':
             verify_fail_count += 1
-            print(f"⚠️ VERIFY_FAIL (第 {verify_fail_count}/{max_verify_retries} 次)")
+            logger.warning(f"VERIFY_FAIL (第 {verify_fail_count}/{max_verify_retries} 次)")
             if verify_fail_count >= max_verify_retries:
-                print(f"⚠️ 已達最大重試次數，身分證可能有誤")
+                logger.warning("已達最大重試次數，身分證可能有誤")
                 update(db['server'], db['username'], db['password'], db['database'], db['totb'],
                        '請重新確認身分證是否無誤', Casei, '', '', '', '', '', '', '', '', '', 'F', today)
+                logger.increment('records_failed')
                 return True
             continue
 
-        # 驗證成功，跳出迴圈
         break
 
     if not verify_result or verify_result.get('error'):
@@ -1041,43 +1017,43 @@ def process_single_case(case_data, today, file_date):
     token = verify_result['token']
     case_uuid = verify_result['caseUid']
 
-    # 計算債務人數量
     debtor_count = len([id.strip() for id in debtor_ids.split(',') if id.strip()])
-    print(f"債務人數量: {debtor_count}")
+    logger.debug(f"債務人數量: {debtor_count}")
 
     # 步驟 4: 提交付款請求 (crr201w/payment)
-    print("\n--- 步驟 4: 提交付款請求 ---")
+    logger.info("步驟 4: 提交付款請求")
     payment_data = submit_payment_request(token, case_uuid, Name, Phone, Mail,
                                          Compiled, Company, Address, debtor_count)
     if not payment_data:
         return False
 
-    # 檢查錯誤訊息
     msg = payment_data.get('msg', '')
     error_type = payment_data.get('error', '')
 
-    # 債務人數量比對失敗 - 回寫資料庫並設 STATUS = 'F'
     if '債務人數量比對失敗' in msg or error_type == 'DEBTOR_COUNT_MISMATCH':
-        print(f"⚠️ {msg}")
+        logger.warning(f"債務人數量比對失敗: {msg}")
         update(db['server'], db['username'], db['password'], db['database'], db['totb'],
                msg, Casei, '', '', '', '', '', '', '', '', '保險查詢費', 'F', today)
+        logger.increment('records_failed')
         return True
 
-    # 查無資料
     if '查無資料' in msg or '該案' in msg:
-        print(f"⚠️ {msg}")
+        logger.warning(f"查無資料: {msg}")
         update(db['server'], db['username'], db['password'], db['database'], db['totb'],
                msg, Casei, '', '', '', '', '', '', '', '', '保險查詢費', 'F', today)
+        logger.increment('records_failed')
         return True
 
     # 步驟 5-7: 使用 Playwright 處理綠界付款流程
-    print("\n--- 步驟 5-7: 綠界付款流程 (Playwright) ---")
+    logger.info("步驟 5-7: 綠界付款流程")
     atm_info = process_ecpay_with_playwright(payment_data, Casei, file_date)
     if not atm_info:
         return False
 
     # 更新資料庫
-    print("\n--- 更新資料庫 ---")
+    logger.ctx.set_operation("DB_update")
+    logger.ctx.set_db(server=db['server'], database=db['database'], table=db['totb'], operation="UPDATE")
+
     update(db['server'], db['username'], db['password'], db['database'], db['totb'],
            '調閱成功', Casei, atm_info.get('MerchantTradeNo', ''),
            '中華民國人壽保險商業同業公會', 'ATM 櫃員機', atm_info.get('ItemName', ''),
@@ -1085,67 +1061,103 @@ def process_single_case(case_data, today, file_date):
            atm_info.get('ExpireDate', ''), atm_info.get('TradeAmount', ''),
            '保險查詢費', 'F', today)
 
-    print(f"\n✅ 案件 {Casei} 處理完成！")
+    logger.log_db_operation("UPDATE", db['database'], db['totb'], 1)
+    logger.info(f"案件 {Casei} 處理完成！")
+    logger.increment('records_success')
     return True
 
 
-def main():
-    """主程式"""
-    print("="*80)
-    print("Legal Insurance Automation - Final (crr901w + crr201w API)")
-    print("="*80)
+def run():
+    """Main execution function"""
+    logger.task_start("保險公會費用查詢")
 
-    today = datetime.datetime.now().strftime('%Y-%m-%d') #'2025-10-06' #'2026-02-22'#
-    file_date = datetime.datetime.now().strftime('%Y%m%d') #'20251006'#'20260208'#'20260222'#
-    print(f"執行日期: {today}")
-    print(f"檔案日期: {file_date}\n")
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    file_date = datetime.datetime.now().strftime('%Y%m%d')
 
-    # 建立目錄
-    os.makedirs(f'./{file_date}', exist_ok=True)
+    logger.info(f"執行日期: {today}")
+    logger.info(f"檔案日期: {file_date}")
+    logger.log_db_connect(db['server'], db['database'], db['username'])
 
-    # 取得待處理案件
-    obs = src_obs(db['server'], db['username'], db['password'], db['database'],
-                  db['fromtb'], db['totb'],today)
+    total_success = 0
+    total_failed = 0
+    total_processed = 0
 
-    print(f"待處理案件數: {obs}\n")
+    try:
+        os.makedirs(f'./{file_date}', exist_ok=True)
 
-    if obs == 0:
-        print("沒有待處理案件")
-        return
+        obs = src_obs(db['server'], db['username'], db['password'], db['database'],
+                      db['fromtb'], db['totb'], today)
 
-    success_count = 0
-    fail_count = 0
+        initial_obs = obs
+        logger.info(f"待處理案件數: {obs}")
 
-    while obs > 0:
-        try:
-            cases = dbfrom(db['server'], db['username'], db['password'],
-                          db['database'], db['fromtb'], db['totb'], today)
+        if obs == 0:
+            logger.info("沒有待處理案件")
+            logger.task_end(success=True)
+            return True
 
-            if not cases:
-                print("查詢案件時返回空列表，重新檢查待處理數量")
+        while obs > 0:
+            try:
+                cases = dbfrom(db['server'], db['username'], db['password'],
+                              db['database'], db['fromtb'], db['totb'], today)
+
+                if not cases:
+                    logger.warning("查詢案件時返回空列表，重新檢查待處理數量")
+                    obs = src_obs(db['server'], db['username'], db['password'], db['database'],
+                                 db['fromtb'], db['totb'], today)
+                    continue
+
+                case_data = cases[0]
+                total_processed += 1
+                logger.log_progress(total_processed, initial_obs, f"case_{total_processed}")
+
+                if process_single_case(case_data, today, file_date):
+                    total_success += 1
+                else:
+                    total_failed += 1
+
                 obs = src_obs(db['server'], db['username'], db['password'], db['database'],
-                             db['fromtb'], db['totb'],today)
-                continue
+                             db['fromtb'], db['totb'], today)
 
-            case_data = cases[0]
+            except Exception as e:
+                logger.log_exception(e, "處理案件時發生錯誤")
+                total_failed += 1
+                total_processed += 1
+                obs = src_obs(db['server'], db['username'], db['password'], db['database'],
+                             db['fromtb'], db['totb'], today)
 
-            if process_single_case(case_data, today, file_date):
-                success_count += 1
-            else:
-                fail_count += 1
+        logger.log_stats({
+            'initial_cases': initial_obs,
+            'total_processed': total_processed,
+            'total_success': total_success,
+            'total_failed': total_failed,
+        })
 
-            obs = src_obs(db['server'], db['username'], db['password'], db['database'],
-                         db['fromtb'], db['totb'],today)
+        logger.task_end(success=(total_failed == 0))
+        return total_failed == 0
 
-        except Exception as e:
-            print(f"\n錯誤: {e}")
-            fail_count += 1
-            obs = src_obs(db['server'], db['username'], db['password'], db['database'],
-                         db['fromtb'], db['totb'],today)
+    except Exception as e:
+        logger.log_exception(e, "執行過程發生錯誤")
+        logger.task_end(success=False)
+        return False
 
-    print("\n" + "="*80)
-    print(f"處理完成！成功: {success_count} | 失敗: {fail_count}")
-    print("="*80)
+
+def main():
+    """Main entry point"""
+    logger.info(f"資料庫: {db['server']}.{db['database']}")
+    logger.info(f"來源表: {db['fromtb']}")
+    logger.info(f"目標表: {db['totb']}")
+
+    try:
+        success = run()
+        if success:
+            logger.info("處理完成")
+        else:
+            logger.warning("部分處理失敗")
+    except KeyboardInterrupt:
+        logger.warning("使用者中斷操作")
+    except Exception as e:
+        logger.log_exception(e, "程式執行錯誤")
 
 
 if __name__ == "__main__":

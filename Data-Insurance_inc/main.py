@@ -1,22 +1,34 @@
+# -*- coding: utf-8 -*-
+"""
+Insurance_inc crawler - 保險登錄機構查詢
+"""
+import os
+import sys
 import requests
 import ddddocr
 import time
 import xml.etree.ElementTree as ET
-import sys
-import re
 import warnings
 import logging
-import os
 
 # 完全抑制警告和 ONNX Runtime 日誌
 warnings.filterwarnings("ignore")
 logging.getLogger("onnxruntime").setLevel(logging.CRITICAL)
-logging.getLogger().setLevel(logging.CRITICAL)
 
 # 設定環境變數以避免 ONNX Runtime 執行緒親和性錯誤
 os.environ['OMP_NUM_THREADS'] = '1'
-os.environ['ONNXRUNTIME_LOG_SEVERITY_LEVEL'] = '4'  # 4 = FATAL，只顯示致命錯誤
+os.environ['ONNXRUNTIME_LOG_SEVERITY_LEVEL'] = '4'
 os.environ['ORT_LOGGING_LEVEL'] = '4'
+
+# Add parent directory to path for common module
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from config import *
+from etl_func import *
+from common.logger import get_logger
+
+# Initialize logger
+logger = get_logger('Data-Insurance_inc')
 
 # 重定向 stderr 以抑制 C++ 層級的錯誤訊息
 class NullWriter:
@@ -26,16 +38,7 @@ class NullWriter:
 # 暫存原始 stderr
 original_stderr = sys.stderr
 
-from config import *
-from etl_func import *
-
-
-# 移除 proxies 設定
-# proxies = {
-#     "http": "http://vct57:8080",
-#     "https": "http://vct57:8080",
-# }
-
+# Session 和 URL 設定
 session = requests.Session()
 url = "https://public.liaroc.org.tw/lia-public/DIS/Servlet/RD"
 captcha_url = "https://public.liaroc.org.tw/lia-public/simpleCaptcha.png"
@@ -53,7 +56,10 @@ headers = {
 }
 
 # 從原始設定檔讀取資料庫設定
-server, database, username, password, totb1, entitytype = db['server'], db['database'], db['username'], db['password'], db['totb1'], db['entitytype']
+server, database, username, password, totb1, entitytype = (
+    db['server'], db['database'], db['username'], db['password'], db['totb1'], db['entitytype']
+)
+
 
 def build_payload(captcha_code, regno):
     """建構查詢用的 XML payload"""
@@ -74,70 +80,60 @@ def build_payload(captcha_code, regno):
             </Root>
             '''
 
+
 def query_regno_requests(regno, max_retry=1000):
-    """
-    使用 requests 方式查詢統編
-    
-    Args:
-        regno: 統一編號
-        max_retry: 最大重試次數（對應原來第一筆的 1000 次重試）
-    
-    Returns:
-        tuple: (success, result_data) 
-               success: bool, 是否查詢成功
-               result_data: dict, 包含查詢結果資料
-    """
+    """使用 requests 方式查詢統編"""
+    logger.ctx.set_data(regno=regno)
+
     for i in range(max_retry):
         try:
             # 1. 取得驗證碼
+            logger.ctx.set_operation("get_captcha")
             captcha_img = session.get(captcha_url, verify=False).content
-            
+
             # 暫時重定向 stderr 以抑制 ONNX Runtime 錯誤訊息
             sys.stderr = NullWriter()
             try:
-                captcha_code = ddddocr.DdddOcr().classification(captcha_img)
+                captcha_code = ddddocr.DdddOcr(show_ad=False).classification(captcha_img)
             finally:
-                # 恢復 stderr
                 sys.stderr = original_stderr
-            print(f"第{i+1}次嘗試，辨識碼為：{captcha_code}")
+
+            logger.log_captcha_attempt(i + 1, True, captcha_code)
 
             # 2. 準備 payload
             payload = build_payload(captcha_code, regno)
-            
+
             # 3. 發送查詢
+            logger.ctx.set_operation("query_insurance")
+            start_time = time.time()
             resp = session.post(url, data=payload.encode("big5"), headers=headers, verify=False)
+            elapsed = time.time() - start_time
+
             result = resp.content.decode("big5", errors="ignore")
 
             # 4. 判斷是否驗證碼錯誤
             if "<CaptchaError>" in result:
-                print("驗證碼錯誤，重新嘗試…")
+                logger.debug(f"驗證碼錯誤 (第 {i+1} 次)")
                 time.sleep(1)
                 continue
             else:
-                print("查詢成功！")
-                
+                logger.debug(f"查詢成功 ({elapsed:.2f}s)")
+
                 # 5. 解析結果
                 result_data = parse_query_result(result)
                 return True, result_data
-                
+
         except Exception as e:
-            print(f"查詢過程發生錯誤: {e}")
+            logger.warning(f"查詢過程發生錯誤 (第 {i+1} 次): {e}")
             time.sleep(1)
             continue
-    
-    print("多次嘗試後仍失敗，請檢查流程或驗證碼辨識")
+
+    logger.warning(f"超過 {max_retry} 次重試仍失敗")
     return False, {'message': '查詢失敗'}
 
+
 def parse_query_result(result):
-    """
-    解析查詢結果
-    
-    Args:
-        result: API 回應的 XML 字串
-    
-    Returns:
-        dict: 解析後的結果資料
-    """
+    """解析查詢結果"""
     result_data = {
         'login_date': '',
         'login_inc': '',
@@ -145,18 +141,18 @@ def parse_query_result(result):
         'status': 'N',
         'message': ''
     }
-    
+
     # 檢查是否查無資料
     if '查無資料' in result:
         result_data['message'] = '查無資料'
         result_data['login_inc'] = '查無資料'
         return result_data
-    
+
     try:
         # 解析 XML
         root = ET.fromstring(result)
         row = root.find('Row')
-        
+
         if row is not None:
             # 提取基本資料
             regno = row.find('regno').text if row.find('regno') is not None else ''
@@ -165,17 +161,17 @@ def parse_query_result(result):
             tarrvd = row.find('tarrvd').text if row.find('tarrvd') is not None else ''
             regUnit = row.find('regUnit').text if row.find('regUnit') is not None else ''
             regnstatus = row.find('regnstatus').text if row.find('regnstatus') is not None else ''
-            
+
             # 組合登錄日期
             if tarrvy and tarrvm and tarrvd:
                 result_data['login_date'] = f"民國{tarrvy}年{tarrvm}月{tarrvd}日"
-            
+
             # 設定 login_inc (登錄機構)
             if regUnit and regUnit.strip():
                 result_data['login_inc'] = regUnit.strip()
             else:
                 result_data['login_inc'] = '未辦理登錄'
-            
+
             # 判斷狀態：如果註銷或未辦理登錄則為 N，否則為 Y
             if '註銷' in regnstatus or '停職' in regnstatus:
                 result_data['status'] = 'N'
@@ -183,107 +179,159 @@ def parse_query_result(result):
                 result_data['status'] = 'Y'
             else:
                 result_data['status'] = 'N'
-            
+
             # 串接保險種類資訊 (kindA~kindZ)
             insurance_types = []
             kind_fields = ['kindA', 'kindB', 'kindC', 'kindD', 'kindE', 'kindF', 'kindG', 'kindH', 'kindI', 'kindZ']
-            
+
             for kind_field in kind_fields:
                 kind_node = row.find(kind_field)
                 if kind_node is not None and kind_node.text and kind_node.text.strip():
                     insurance_types.append(kind_node.text.strip())
-            
+
             # 將所有保險種類用適當的分隔符串接
             if insurance_types:
                 result_data['Insurance_type'] = '、'.join(insurance_types)
             else:
                 result_data['Insurance_type'] = ''
-                
+
         else:
             # 查詢成功但沒有資料
             result_data['login_inc'] = '未辦理登錄'
             result_data['message'] = '查詢成功，但沒有找到資料'
-            
+
     except Exception as e:
-        print("XML 解析失敗:", e)
-        print(result)
+        logger.warning(f"XML 解析失敗: {e}")
         result_data['message'] = 'XML解析錯誤'
         result_data['login_inc'] = 'XML解析錯誤'
-    
+
     return result_data
 
+
 def process_single_record(record_data, is_first_record=False):
-    """
-    處理單筆記錄的查詢和資料庫更新
-    
-    Args:
-        record_data: dict, 包含 name, ID, IDN_10 等資訊
-        is_first_record: bool, 是否為第一筆記錄（影響重試次數）
-    """
+    """處理單筆記錄的查詢和資料庫更新"""
     name = record_data['name']
     ID = record_data['ID']
     IDN_10 = record_data['IDN_10']
-    
-    print(f"處理記錄: ID={ID}, IDN_10={IDN_10}")
-    
+
+    logger.ctx.set_data(ID=ID, IDN_10=IDN_10)
+    logger.debug(f"處理記錄: ID={ID}, IDN_10={IDN_10}")
+
     # 根據是否為第一筆記錄決定重試次數
     max_retry = 1000 if is_first_record else 10
-    
+
     # 執行查詢
     success, result_data = query_regno_requests(IDN_10, max_retry)
-    
+
     # 準備資料庫更新資料
     updatetime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     login_date = result_data['login_date']
     login_inc = result_data['login_inc']
     Insurance_type = result_data['Insurance_type']
     status = result_data['status']
-    
+
     # 更新資料庫
+    logger.ctx.set_operation("DB_update")
+    logger.ctx.set_db(server=server, database=database, table=totb1, operation="UPDATE")
+
     updateSQL(server, username, password, database, totb1, entitytype, status, updatetime, ID, IDN_10, Insurance_type, login_date, login_inc)
-    print(f"更新結果: {ID}, {IDN_10}, {login_date}, {login_inc}, {Insurance_type}, {status}")
-    
+    logger.log_db_operation("UPDATE", database, totb1, 1)
+    logger.info(f"更新完成: ID={ID}, 機構={login_inc}, 狀態={status}")
+
     # 檢查今日查詢筆數限制
     exit_o = exit_obs(server, username, password, database, totb1)
     if exit_o >= 5000:
-        print("今日查詢筆數已達上限 5000 筆，程式結束")
-        sys.exit()
+        logger.warning("今日查詢筆數已達上限 5000 筆")
+        return False
+
+    return True
+
+
+def run():
+    """Main execution function"""
+    logger.task_start("保險登錄機構查詢")
+    logger.log_db_connect(server, database, username)
+
+    total_processed = 0
+    total_success = 0
+    total_failed = 0
+
+    try:
+        obs = src_obs(server, username, password, database, totb1, entitytype)
+        logger.info(f"待處理筆數: {obs}")
+
+        if obs == 0:
+            logger.info("沒有待處理的資料")
+            logger.task_end(success=True)
+            return True
+
+        for i in range(obs):
+            total_processed += 1
+            logger.log_progress(total_processed, obs, f"record_{total_processed}")
+
+            try:
+                # 從資料庫取得待處理資料
+                src = dbfrom(server, username, password, database, totb1, entitytype)
+
+                if not src or len(src) == 0:
+                    logger.info("沒有待處理的記錄")
+                    break
+
+                record_data = {
+                    'name': src[0][1],
+                    'ID': src[0][2],
+                    'IDN_10': src[0][4]
+                }
+
+                # 處理記錄（第一筆記錄有特殊處理）
+                is_first_record = (i == 0)
+                if process_single_record(record_data, is_first_record):
+                    total_success += 1
+                    logger.increment('records_success')
+                else:
+                    # 達到上限，跳出迴圈
+                    break
+
+                # 每筆記錄間隔，避免請求過於頻繁
+                time.sleep(2)
+
+            except Exception as e:
+                logger.log_exception(e, f"處理第 {total_processed} 筆資料時發生錯誤")
+                total_failed += 1
+                logger.increment('records_failed')
+                continue
+
+        logger.log_stats({
+            'total_processed': total_processed,
+            'total_success': total_success,
+            'total_failed': total_failed,
+        })
+
+        logger.task_end(success=(total_failed == 0))
+        return total_failed == 0
+
+    except Exception as e:
+        logger.log_exception(e, "執行過程發生錯誤")
+        logger.task_end(success=False)
+        return False
+
 
 def main():
-    """主程式邏輯"""
+    """Main entry point"""
+    logger.info(f"資料庫: {db['server']}.{db['database']}")
+    logger.info(f"目標表: {totb1}")
+
     try:
-        # 取得總筆數
-        obs = src_obs(server, username, password, database, totb1, entitytype)
-        print(f"總共需要處理 {obs} 筆記錄")
-        
-        # 處理每筆記錄
-        for i in range(obs):
-            # 從資料庫取得待處理資料
-            src = dbfrom(server, username, password, database, totb1, entitytype)
-            
-            if not src or len(src) == 0:
-                print("沒有待處理的記錄")
-                break
-                
-            record_data = {
-                'name': src[0][1],
-                'ID': src[0][2],
-                'IDN_10': src[0][4]
-            }
-            
-            # 處理記錄（第一筆記錄有特殊處理）
-            is_first_record = (i == 0)
-            process_single_record(record_data, is_first_record)
-            
-            # 每筆記錄間隔，避免請求過於頻繁
-            time.sleep(2)
-            
+        success = run()
+        if success:
+            logger.info("執行完成")
+        else:
+            logger.warning("執行過程有錯誤")
     except KeyboardInterrupt:
-        print("\n程式被使用者中斷")
+        logger.warning("使用者中斷操作")
     except Exception as e:
-        print(f"程式執行錯誤: {e}")
-    finally:
-        print("程式執行完畢")
+        logger.log_exception(e, "程式執行錯誤")
+
 
 if __name__ == "__main__":
     main()
