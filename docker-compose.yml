@@ -1,0 +1,93 @@
+# Crawlab + n8n Docker Compose
+#
+# 使用方式:
+#   docker-compose up -d --build
+#
+# 服務:
+#   - n8n: 工作流程自動化平台 (Port 5678)
+#   - crawlab: 爬蟲執行環境 + API (Port 8000)
+
+version: '3.8'
+
+services:
+  # ============================================
+  # n8n - 工作流程自動化平台
+  # ============================================
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: always
+    ports:
+      - "5678:5678"
+    environment:
+      # 基本認證
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_USER:-admin}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_PASSWORD:-ChangeThisPassword}
+      # 時區
+      - GENERIC_TIMEZONE=Asia/Taipei
+      - TZ=Asia/Taipei
+      # Log 設定
+      - N8N_LOG_LEVEL=info
+      # 執行記錄
+      - EXECUTIONS_DATA_SAVE_ON_ERROR=all
+      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
+      - EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS=true
+      # Webhook (如需外部訪問，修改為實際 IP)
+      - WEBHOOK_URL=${WEBHOOK_URL:-http://localhost:5678/}
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - crawlab-network
+    depends_on:
+      crawlab:
+        condition: service_healthy
+
+  # ============================================
+  # Crawlab - 爬蟲執行環境
+  # ============================================
+  crawlab:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: crawlab
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - TZ=Asia/Taipei
+      - PYTHONUNBUFFERED=1
+      - PYTHONIOENCODING=utf-8
+    volumes:
+      # Log 持久化
+      - ./logs:/app/logs
+      # 輸出檔案持久化
+      - ./output:/app/output
+      # 暫存檔案
+      - ./temp:/app/temp
+    networks:
+      - crawlab-network
+    # 健康檢查
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+# ============================================
+# 網路設定
+# ============================================
+networks:
+  crawlab-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+# ============================================
+# 資料卷
+# ============================================
+volumes:
+  n8n_data:
+    driver: local
